@@ -1,0 +1,35 @@
+# requirements.txt
+
+# Core ML
+torch
+transformers
+datasets
+accelerate
+scikit-learn
+
+# NLP
+sentence-transformers
+faiss-cpu
+
+# API
+fastapi
+uvicorn
+pydantic
+
+# Dashboard
+streamlit
+plotly
+pandas
+
+# LLM Integration
+openai
+litellm
+
+# Utilities
+python-dotenv
+loguru
+pyyaml
+numpy
+
+# Testing
+pytest

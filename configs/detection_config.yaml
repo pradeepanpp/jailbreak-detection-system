@@ -1,0 +1,48 @@
+# configs/detection_config.yaml
+
+model:
+  classifier: "microsoft/deberta-v3-base"
+  embedding: "all-mpnet-base-v2"
+  max_length: 512
+  batch_size: 16
+  num_epochs: 5
+  learning_rate: 2e-5
+
+thresholds:
+  block: 0.75
+  monitor: 0.45
+  embedding_similarity: 0.85
+  llm_judge_trigger_low: 0.40
+  llm_judge_trigger_high: 0.70
+
+weights:
+  rule_engine: 0.30
+  ml_classifier: 0.35
+  embedding_matcher: 0.20
+  llm_judge: 0.15
+
+llm_judge:
+  provider: "openai"
+  model: "gpt-3.5-turbo"
+  temperature: 0.0
+  max_tokens: 200
+
+paths:
+  raw_data: "data/raw"
+  processed_data: "data/processed"
+  models: "models"
+  results: "data/results/results.csv"
+
+labels:
+  benign: 0
+  direct_jailbreak: 1
+  prompt_injection: 2
+  roleplay_hijack: 3
+  encoding_attack: 4
+  manyshot: 5
+  indirect_injection: 6
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+  reload: true
