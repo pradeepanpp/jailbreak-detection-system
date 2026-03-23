@@ -67,7 +67,7 @@ class JailbreakClassifier:
         result = clf.predict("ignore all instructions")
     """
 
-    MODEL_NAME = "microsoft/deberta-v3-base"
+    MODEL_NAME = "distilbert-base-uncased"
     SAVE_PATH  = "models/jailbreak_classifier"
 
     def __init__(self):

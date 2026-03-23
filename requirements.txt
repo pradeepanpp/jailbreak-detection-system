@@ -33,3 +33,6 @@ numpy
 
 # Testing
 pytest
+
+sentencepiece          ← crashes DeBERTa tokenizer without it
+protobuf               ← required by sentencepiece on Windows
