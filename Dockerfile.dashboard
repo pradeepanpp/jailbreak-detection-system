@@ -16,7 +16,7 @@ COPY src/jailbreak_detection/__init__.py src/jailbreak_detection/
 COPY src/jailbreak_detection/constants/  src/jailbreak_detection/constants/
 
 ENV PYTHONPATH=/app \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 
 
 EXPOSE 8501
 
