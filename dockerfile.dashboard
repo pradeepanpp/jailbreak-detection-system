@@ -1,0 +1,27 @@
+# Dockerfile.dashboard
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
+# Only install dashboard dependencies
+RUN pip install --no-cache-dir \
+    streamlit==1.35.0 \
+    requests==2.31.0
+
+COPY src/jailbreak_detection/dashboard/ src/jailbreak_detection/dashboard/
+COPY src/jailbreak_detection/__init__.py src/jailbreak_detection/
+COPY src/jailbreak_detection/constants/  src/jailbreak_detection/constants/
+
+ENV PYTHONPATH=/app \
+    PYTHONUNBUFFERED=1
+
+EXPOSE 8501
+
+CMD ["streamlit", "run", \
+     "src/jailbreak_detection/dashboard/app.py", \
+     "--server.port=8501", \
+     "--server.address=0.0.0.0", \
+     "--server.headless=true"]

@@ -1,0 +1,59 @@
+# docker-compose.yml
+# One-command startup: docker compose up
+#
+# Services:
+#   api       — FastAPI detection engine on :8000
+#   dashboard — Streamlit UI on :8501
+#
+# Usage:
+#   docker compose up           # start both services
+#   docker compose up api       # API only
+#   docker compose logs -f api  # stream API logs
+#   docker compose down         # stop everything
+
+version: "3.9"
+
+services:
+
+  # ── Detection API ────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: jailbreak-api
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount models so they survive container restarts
+      - ./models:/app/models:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - PORT=8000
+      - HOST=0.0.0.0
+      - PYTHONUNBUFFERED=1
+      - HF_HUB_DISABLE_SYMLINKS_WARNING=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ── Streamlit Dashboard ───────────────────────
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    container_name: jailbreak-dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      - API_BASE=http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
