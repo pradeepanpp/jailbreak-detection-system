@@ -1,6 +1,6 @@
 # LLM Jailbreak Detection System
 
-A production-grade, multi-layer adversarial prompt detection system for Large Language Models. Combines deterministic rule matching, fine-tuned transformer classification, and semantic similarity search to identify and block jailbreak attempts, prompt injections, and other adversarial inputs.
+A production-grade multi-layer adversarial prompt detection system for large language models. It combines deterministic rule matching, fine-tuned transformer classification, and semantic similarity search to identify and block jailbreak attempts, prompt injections, and other adversarial inputs.
 
 
 ---
@@ -130,4 +130,4 @@ PyTorch · HuggingFace Transformers · FAISS · FastAPI · Streamlit · Docker
 
 ## Note on Scope
 
-This system detects **jailbreak mechanics** — instruction overrides, encoding attacks, roleplay framing. Direct harmful questions without jailbreak structure score low by design; those are handled by the downstream LLM's own safety layer.
+This system detects **jailbreak mechanics**, including instruction overrides, encoding attacks, and roleplay framing. Direct harmful questions without a jailbreak structure score low by design and are handled by the downstream LLM's own safety layer.
