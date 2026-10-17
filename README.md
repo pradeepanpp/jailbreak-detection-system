@@ -12,9 +12,11 @@ Detect jailbreak and prompt-injection attempts before they reach a language mode
 </div>
 
 
-**Problem.** Applications built on LLMs receive prompts that try to override their instructions: "ignore all previous instructions", fake system messages, role-play framing, encoded payloads, many-shot examples and instructions hidden inside documents. Keyword filters miss reworded attacks and also block normal users who happen to use words like "ignore" or "developer mode".
+**Problem.** 
+Applications built on LLMs receive prompts that try to override their instructions: "ignore all previous instructions", fake system messages, role-play framing, encoded payloads, many-shot examples and instructions hidden inside documents. Keyword filters miss reworded attacks and also block normal users who happen to use words like "ignore" or "developer mode".
 
-**Solution.** A detection service that scores every prompt with three layers and returns **BLOCK**, **MONITOR** or **ALLOW**, the attack type, and which layer fired:
+**Solution.** 
+A detection service that scores every prompt with three layers and returns **BLOCK**, **MONITOR** or **ALLOW**, the attack type, and which layer fired:
 
 1. **Rules:** 36 regex patterns for known attack signatures (under 1 ms)
 2. **Classifier:** fine-tuned DistilBERT, 7 classes (benign + 6 attack types)
