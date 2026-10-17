@@ -24,10 +24,9 @@ import os
 sys.path.append(".")
 
 import pandas as pd
-import numpy as np
 
 from src.jailbreak_detection.detection.embedding_matcher import EmbeddingMatcher
-from src.jailbreak_detection.constants import LABEL_MAP, ID_TO_LABEL
+from src.jailbreak_detection.constants import LABEL_MAP
 from src.jailbreak_detection.utils import logger, ensure_dirs
 
 

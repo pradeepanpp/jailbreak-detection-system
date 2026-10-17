@@ -18,12 +18,12 @@ Tabs:
     4. About       — system info and model details
 """
 
+import os
 import sys
 sys.path.append(".")
 
 import requests
 import streamlit as st
-from streamlit.components.v1 import html as st_html
 
 from src.jailbreak_detection.dashboard.components import (
     inject_css,
@@ -47,7 +47,8 @@ st.set_page_config(
     initial_sidebar_state = "expanded",
 )
 
-API_BASE = "http://localhost:8000"
+# docker-compose sets API_BASE=http://api:8000; localhost is for local runs
+API_BASE = os.environ.get("API_BASE", "http://localhost:8000")
 
 
 # ─────────────────────────────────────────────
@@ -75,7 +76,7 @@ def fetch_health() -> dict | None:
     """Fetch /health — cached for 10 seconds."""
     try:
         r = requests.get(f"{API_BASE}/health", timeout=2)
-        return r.json() if r.status_code == 200 else None
+        return r.json() if r.status_code in (200, 503) else None   # 503 = degraded
     except Exception:
         return None
 
@@ -326,7 +327,7 @@ def main():
         batch_btn = st.button("RUN BATCH →", use_container_width=False)
 
         if batch_btn:
-            lines = [l.strip() for l in batch_input.split("\n") if l.strip()]
+            lines = [line.strip() for line in batch_input.split("\n") if line.strip()]
             if not lines:
                 st.warning("Enter at least one text.")
             elif len(lines) > 50:
@@ -398,10 +399,10 @@ def main():
 
             layers_info = [
                 ("LAYER 1 · RULE ENGINE",
-                 "33 regex patterns for known attack signatures. Fastest layer — runs first. Severity 1–5 scoring. Zero false positives on known patterns.",
+                 "Regex patterns for known attack signatures. Fastest layer — runs first. Severity 1–5 scoring; ambiguous phrases (e.g. 'developer mode') get low severity so the ML layer decides.",
                  "#00d4ff"),
                 ("LAYER 2 · ML CLASSIFIER",
-                 "Fine-tuned DistilBERT-base-uncased. 7-class classification: benign + 6 attack types. Trained on 333 samples. F1=0.884 on test set.",
+                 "Fine-tuned DistilBERT-base-uncased. 7-class classification: benign + 6 attack types. Long inputs keep the first and last tokens, so many-shot payloads at the end are not cut off.",
                  "#00d4ff"),
                 ("LAYER 3 · EMBEDDING MATCHER",
                  "Sentence embeddings via all-mpnet-base-v2. FAISS IndexFlatIP with 204 attack vectors. Cosine similarity for novel attack detection.",

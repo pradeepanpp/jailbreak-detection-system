@@ -189,7 +189,7 @@ def test_latency_plausible():
     # Test 19 — All positive
     for key in ["mean_ms", "p50_ms", "p95_ms", "min_ms", "max_ms"]:
         assert lat[key] > 0, f"{key}={lat[key]} should be positive"
-    print(f"✅ Test 19 passed: All latencies positive")
+    print("✅ Test 19 passed: All latencies positive")
 
     # Test 20 — Ordering: min ≤ p50 ≤ mean ≤ p95 ≤ max
     assert lat["min_ms"] <= lat["p50_ms"], "min > p50"

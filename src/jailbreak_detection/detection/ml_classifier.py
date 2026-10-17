@@ -2,8 +2,13 @@
 """
 Layer 2 — ML Classifier.
 
-Fine-tunes DeBERTa-v3-base on jailbreak datasets.
+Fine-tuned DistilBERT (distilbert-base-uncased) on jailbreak datasets.
 Multi-class classifier predicting attack category.
+
+Long inputs: the model reads at most `max_length` tokens. Many-shot
+attacks put the real request at the END, so plain right-truncation would
+cut it off. `encode_head_tail` keeps the first HEAD_TOKENS and the last
+tokens instead (used in training and inference alike).
 
 Input  : raw text string
 Output : predicted category + confidence scores per class
@@ -12,9 +17,7 @@ Output : predicted category + confidence scores per class
 import os
 import torch
 import numpy as np
-from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional
 
 from transformers import (
     AutoTokenizer,
@@ -32,6 +35,7 @@ from sklearn.metrics import (
 
 from src.jailbreak_detection.utils import logger, load_config
 from src.jailbreak_detection.constants import LABEL_MAP, ID_TO_LABEL
+from src.jailbreak_detection.detection.tokenization import encode_head_tail, pad_batch
 
 
 # -----------------------------------------------
@@ -55,7 +59,7 @@ class ClassifierResult:
 
 class JailbreakClassifier:
     """
-    Fine-tuned DeBERTa-v3-base for jailbreak detection.
+    Fine-tuned DistilBERT for jailbreak detection.
 
     Usage:
         # Training
@@ -92,7 +96,8 @@ class JailbreakClassifier:
 
     def train(self, train_df, val_df):
         """
-        Fine-tune DeBERTa-v3-base on your dataset.
+        Fine-tune DistilBERT on your dataset (scripts/train_classifier.py
+        is the main training entry point; this is a minimal alternative).
 
         Args:
             train_df : DataFrame with columns [text, label]
@@ -121,7 +126,7 @@ class JailbreakClassifier:
             learning_rate=self.config["model"]["learning_rate"],
             warmup_ratio=0.1,
             weight_decay=0.01,
-            evaluation_strategy="epoch",
+            eval_strategy="epoch",
             save_strategy="epoch",
             load_best_model_at_end=True,
             metric_for_best_model="f1",
@@ -209,14 +214,7 @@ class JailbreakClassifier:
                 "Model not loaded. Call JailbreakClassifier.load() first."
             )
 
-        # Tokenize
-        inputs = self.tokenizer(
-            text,
-            return_tensors="pt",
-            truncation=True,
-            padding=True,
-            max_length=self.config["model"]["max_length"]
-        ).to(self.device)
+        inputs = self._encode([text])
 
         # Forward pass
         with torch.no_grad():
@@ -252,13 +250,7 @@ class JailbreakClassifier:
         if not self.model or not self.tokenizer:
             raise RuntimeError("Model not loaded.")
 
-        inputs = self.tokenizer(
-            texts,
-            return_tensors="pt",
-            truncation=True,
-            padding=True,
-            max_length=self.config["model"]["max_length"]
-        ).to(self.device)
+        inputs = self._encode(texts)
 
         with torch.no_grad():
             outputs = self.model(**inputs)
@@ -284,6 +276,12 @@ class JailbreakClassifier:
             ))
 
         return results
+
+    def _encode(self, texts: list):
+        """Head+tail tokenization, padded into a batch on the model device."""
+        ids   = encode_head_tail(self.tokenizer, texts, self.config["model"]["max_length"])
+        batch = pad_batch(ids, self.tokenizer.pad_token_id or 0)
+        return {k: torch.tensor(v, device=self.device) for k, v in batch.items()}
 
     # -----------------------------------------------
     # SAVE / LOAD

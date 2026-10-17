@@ -66,7 +66,7 @@ def test_health_endpoint():
     assert "ml_classifier" in data
     assert "embedding"     in data
     assert "model_info"    in data
-    print(f"✅ Test 4 passed: Health schema correct")
+    print("✅ Test 4 passed: Health schema correct")
 
     # Test 5 — Status is one of valid values
     assert data["status"] in ["ok", "degraded", "error"]
@@ -130,7 +130,7 @@ def test_analyze_attack():
     assert "rule_score"      in layers
     assert "ml_score"        in layers
     assert "embedding_score" in layers
-    print(f"✅ Test 13 passed: Layer breakdown included")
+    print("✅ Test 13 passed: Layer breakdown included")
     print(f"   rule={layers['rule_score']:.3f} ml={layers['ml_score']:.3f} emb={layers['embedding_score']:.3f}")
 
 
@@ -277,10 +277,10 @@ def test_input_validation():
     assert response.status_code == 422
     print("✅ Test 33 passed: Empty batch returns 422")
 
-    # Test 34 — Batch with >50 texts returns 422
-    response = client.post("/analyze/batch", json={"texts": ["hello"] * 51})
+    # Test 34 — Batch with >20 texts returns 422
+    response = client.post("/analyze/batch", json={"texts": ["hello"] * 21})
     assert response.status_code == 422
-    print("✅ Test 34 passed: Batch >50 texts returns 422")
+    print("✅ Test 34 passed: Batch >20 texts returns 422")
 
 
 def test_stats_endpoint():

@@ -1,11 +1,12 @@
 # scripts/train_classifier.py
 """
-Phase 2 — Step 3: Fine-tune DeBERTa-v3-base on jailbreak dataset.
+Phase 2 — Step 3: Fine-tune DistilBERT on the jailbreak dataset.
 
 Key features:
   - Weighted cross-entropy loss (fixes class imbalance)
   - CPU-safe training arguments
   - Early stopping to prevent overfitting on small dataset
+  - Head+tail truncation for long inputs (many-shot payloads sit at the end)
   - Full per-class evaluation report
   - Auto-saves best model checkpoint
 
@@ -26,7 +27,6 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
 
 from transformers import (
     AutoTokenizer,
@@ -47,6 +47,7 @@ from sklearn.utils.class_weight import compute_class_weight
 
 from src.jailbreak_detection.utils import logger, load_config
 from src.jailbreak_detection.constants import LABEL_MAP, ID_TO_LABEL
+from src.jailbreak_detection.detection.tokenization import encode_head_tail, pad_batch
 
 
 # ─────────────────────────────────────────────
@@ -61,15 +62,14 @@ NUM_LABELS = len(LABEL_MAP)
 
 # ─────────────────────────────────────────────
 # WEIGHTED LOSS TRAINER
-# Fixes the direct_jailbreak imbalance (120 vs ~35 for others)
+# Fixes class imbalance (benign is the largest class)
 # ─────────────────────────────────────────────
 
 class WeightedLossTrainer(Trainer):
     """
     Custom Trainer that applies per-class weights to the loss.
 
-    Without this, the model learns to over-predict direct_jailbreak
-    because it has 3x more samples than other categories.
+    Without this, the model over-predicts the largest class.
 
     class_weights tensor is injected at instantiation.
     """
@@ -157,12 +157,9 @@ def tokenize_dataset(
     dataset = Dataset.from_pandas(df[["text", "label"]].reset_index(drop=True))
 
     def tokenize_fn(batch):
-        return tokenizer(
-            batch["text"],
-            truncation=True,
-            padding=False,      # DataCollatorWithPadding handles this
-            max_length=max_length
-        )
+        # Head+tail truncation; DataCollatorWithPadding pads per batch
+        ids = encode_head_tail(tokenizer, batch["text"], max_length)
+        return {"input_ids": ids, "attention_mask": [[1] * len(i) for i in ids]}
 
     tokenized = dataset.map(
         tokenize_fn,
@@ -207,8 +204,7 @@ def get_training_args(config: dict, device: torch.device) -> TrainingArguments:
     """
     on_gpu = (device.type == "cuda")
 
-    # On CPU with 233 training samples:
-    # batch_size=8, grad_accum=4 → effective batch=32
+    # On CPU: batch_size=8, grad_accum=4 → effective batch=32
     # This is stable and won't OOM on CPU
     batch_size = config["model"]["batch_size"] if on_gpu else 8
     grad_accum = 1 if on_gpu else 4
@@ -268,13 +264,9 @@ def evaluate_on_test(
 
     for i in range(0, len(texts), batch_size):
         batch_texts = texts[i:i + batch_size]
-        inputs      = tokenizer(
-            batch_texts,
-            return_tensors  = "pt",
-            truncation      = True,
-            padding         = True,
-            max_length      = config["model"]["max_length"]
-        ).to(device)
+        ids         = encode_head_tail(tokenizer, batch_texts, config["model"]["max_length"])
+        padded      = pad_batch(ids, tokenizer.pad_token_id or 0)
+        inputs      = {k: torch.tensor(v, device=device) for k, v in padded.items()}
 
         with torch.no_grad():
             outputs = model(**inputs)
@@ -376,7 +368,7 @@ def main():
     # ── 6. Training arguments ─────────────────────────
     training_args = get_training_args(config, device)
 
-    logger.info(f"\nTraining config:")
+    logger.info("\nTraining config:")
     logger.info(f"  Epochs         : {training_args.num_train_epochs}")
     logger.info(f"  Batch size     : {training_args.per_device_train_batch_size}")
     logger.info(f"  Grad accum     : {training_args.gradient_accumulation_steps}")
@@ -405,11 +397,11 @@ def main():
     logger.info("  Starting Training")
     logger.info("=" * 52)
     logger.info("NOTE: On CPU this will take 10–30 min depending on your machine.")
-    logger.info("Each epoch trains on 233 samples — watch F1 improve per epoch.\n")
+    logger.info(f"Each epoch trains on {len(train_df)} samples — watch F1 improve per epoch.\n")
 
     train_result = trainer.train()
 
-    logger.info(f"\nTraining complete!")
+    logger.info("\nTraining complete!")
     logger.info(f"  Total steps   : {train_result.global_step}")
     logger.info(f"  Training loss : {train_result.training_loss:.4f}")
 
@@ -440,18 +432,9 @@ def main():
     logger.info(f"  Test F1        : {metrics['f1']:.4f}")
     logger.info(f"  Test Accuracy  : {metrics['accuracy']:.4f}")
 
-    # Interpret results for the user
-    f1 = metrics["f1"]
-    if f1 >= 0.85:
-        quality = "Excellent — production ready"
-    elif f1 >= 0.70:
-        quality = "Good — solid for portfolio demo"
-    elif f1 >= 0.55:
-        quality = "Acceptable — add WildGuard data to improve"
-    else:
-        quality = "Low — WildGuard data will significantly help"
-
-    logger.info(f"  Quality        : {quality}")
+    logger.info("  Note: this is the classifier alone on the in-distribution test")
+    logger.info("  split. Run scripts/evaluate.py for the full system, the held-out")
+    logger.info("  hard negatives and the external test set.")
     logger.info("=" * 52)
     logger.info("Next → python scripts/build_index.py")
 

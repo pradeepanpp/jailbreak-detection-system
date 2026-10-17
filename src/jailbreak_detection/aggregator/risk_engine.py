@@ -19,35 +19,37 @@ Architecture:
                                  category              explanation
                                  severity              layer_breakdown
 
-Scoring weights:
-    Rule engine   0.40  — deterministic, highest precision
-    ML classifier 0.35  — trained on dataset, category-aware
-    Embedding     0.25  — semantic similarity, novel attack coverage
+Scoring weights and thresholds come from configs/detection_config.yaml
+(defaults: rule 0.40, ML 0.35, embedding 0.25; BLOCK >= 0.65, MONITOR >= 0.35).
 
 Hard override rules (applied BEFORE weighted scoring):
     1. Rule severity 5 (CRITICAL) → always BLOCK, skip ML
     2. Rule severity 4 + ml_score > 0.7 → BLOCK
-    3. Any single layer score > 0.95 → BLOCK immediately
-    4. Benign classification + low rule + low embedding → ALLOW fast path
+    3. Any single layer score >= 0.95 → risk raised to at least 0.90
+
+Decoded input: the normalizer returns the original text plus any decoded
+variants (base64, ROT13, leetspeak, ...). Each layer scores every variant
+and keeps the highest risk, so a wrong decode can never hide the original.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from src.jailbreak_detection.detection.rule_engine import (
     RuleEngine,
     RuleEngineResult,
-)
-from src.jailbreak_detection.detection.ml_classifier import (
-    JailbreakClassifier,
-    ClassifierResult,
+    RuleMatch,
 )
 from src.jailbreak_detection.detection.embedding_matcher import (
     EmbeddingMatcher,
     EmbeddingResult,
 )
+
+if TYPE_CHECKING:   # torch is only imported when the classifier is loaded
+    from src.jailbreak_detection.detection.ml_classifier import ClassifierResult
 from src.jailbreak_detection.preprocessing.normalizer import TextNormalizer
-from src.jailbreak_detection.preprocessing.decoder import Decoder
 from src.jailbreak_detection.constants import (
     DECISION_BLOCK,
     DECISION_MONITOR,
@@ -58,21 +60,35 @@ from src.jailbreak_detection.constants import (
     SEVERITY_LOW,
     SEVERITY_MINIMAL,
 )
-from src.jailbreak_detection.utils import logger
+from src.jailbreak_detection.utils import logger, load_config
 
 
 # ─────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────
 
+def _config_section(name: str) -> dict:
+    try:
+        return load_config().get(name) or {}
+    except Exception as e:   # missing/broken config → documented defaults
+        logger.warning(f"Config not loaded ({e}); using default weights")
+        return {}
+
+
+_W = _config_section("weights")
+_T = _config_section("thresholds")
+
 # Weighted contribution of each layer to final risk score
-WEIGHT_RULE      = 0.40
-WEIGHT_ML        = 0.35
-WEIGHT_EMBEDDING = 0.25
+WEIGHT_RULE      = float(_W.get("rule_engine",       0.40))
+WEIGHT_ML        = float(_W.get("ml_classifier",     0.35))
+WEIGHT_EMBEDDING = float(_W.get("embedding_matcher", 0.25))
 
 # Final risk score thresholds
-RISK_BLOCK_THRESHOLD   = 0.65
-RISK_MONITOR_THRESHOLD = 0.35
+RISK_BLOCK_THRESHOLD   = float(_T.get("block",   0.65))
+RISK_MONITOR_THRESHOLD = float(_T.get("monitor", 0.35))
+
+# Max text views scored per request (original + decoded variants)
+MAX_VARIANTS = 3
 
 
 # ─────────────────────────────────────────────
@@ -154,6 +170,8 @@ class RiskEngine:
         self,
         load_classifier:  bool = True,
         load_embedding:   bool = True,
+        classifier=None,
+        embedding=None,
     ):
         """
         Initialize all detection layers.
@@ -161,21 +179,23 @@ class RiskEngine:
         Args:
             load_classifier: Load ML classifier (set False for rule-only mode)
             load_embedding:  Load embedding index (set False if index not built)
+            classifier:      Pre-built classifier (used by tests; skips loading)
+            embedding:       Pre-built embedding matcher (used by tests)
         """
         logger.info("Initializing RiskEngine...")
 
         # Layer 0 — Preprocessing (always active)
         self.normalizer = TextNormalizer()
-        self.decoder    = Decoder()
 
         # Layer 1 — Rule Engine (always active, zero dependencies)
         self.rule_engine = RuleEngine()
 
         # Layer 2 — ML Classifier (requires trained model)
-        self.classifier     = None
-        self.classifier_ok  = False
-        if load_classifier:
+        self.classifier     = classifier
+        self.classifier_ok  = classifier is not None
+        if load_classifier and classifier is None:
             try:
+                from src.jailbreak_detection.detection.ml_classifier import JailbreakClassifier
                 self.classifier    = JailbreakClassifier.load(self.MODEL_PATH)
                 self.classifier_ok = True
                 logger.info("ML classifier loaded ✓")
@@ -184,9 +204,9 @@ class RiskEngine:
                 logger.warning("Running without ML layer — rule + embedding only")
 
         # Layer 3 — Embedding Matcher (requires built index)
-        self.embedding      = None
-        self.embedding_ok   = False
-        if load_embedding:
+        self.embedding      = embedding
+        self.embedding_ok   = embedding is not None
+        if load_embedding and embedding is None:
             try:
                 matcher = EmbeddingMatcher()
                 ok      = matcher.load(self.INDEX_PATH)
@@ -225,11 +245,16 @@ class RiskEngine:
         if not text or not isinstance(text, str):
             return self._empty_result(text or "")
 
-        # ── 0. Preprocess ─────────────────────────────
-        processed = self._preprocess(text)
+        # ── 0. Preprocess (decode once, keep original) ──
+        processed, variants, methods = self._preprocess(text)
 
-        # ── 1. Rule Engine ────────────────────────────
-        rule_result = self.rule_engine.check(processed)
+        # ── 1. Rule Engine — cheap, so score every variant ──
+        rule_result = max(
+            (self.rule_engine.check(v) for v in variants),
+            key=lambda r: (r.max_severity, r.rule_score),
+        )
+        if methods:
+            rule_result = self._add_obfuscation_signal(rule_result, methods, processed)
 
         # Hard override 1 — Critical severity → immediate BLOCK
         if rule_result.max_severity >= SEVERITY_CRITICAL:
@@ -247,7 +272,10 @@ class RiskEngine:
         ml_result = None
         if self.classifier_ok:
             try:
-                ml_result = self.classifier.predict(processed)
+                ml_result = max(
+                    (self.classifier.predict(v) for v in variants),
+                    key=lambda r: r.ml_score,
+                )
             except Exception as e:
                 logger.warning(f"ML classifier inference failed: {e}")
 
@@ -271,7 +299,10 @@ class RiskEngine:
         emb_result = None
         if self.embedding_ok:
             try:
-                emb_result = self.embedding.match(processed)
+                emb_result = max(
+                    (self.embedding.match(v) for v in variants),
+                    key=lambda r: r.embedding_score,
+                )
             except Exception as e:
                 logger.warning(f"Embedding matcher inference failed: {e}")
 
@@ -520,19 +551,47 @@ class RiskEngine:
     # PREPROCESSING
     # ─────────────────────────────────────────
 
-    def _preprocess(self, text: str) -> str:
+    def _preprocess(self, text: str) -> tuple[str, list, list]:
         """
-        Run text through decoder + normalizer before detection.
-        This catches encoding attacks before any rule/ML processing.
+        Run the normalizer once (it runs the decoders internally).
+
+        Returns:
+            processed: text shown to users (decoded text if encoding found)
+            variants:  texts the detectors score — original first, then
+                       decoded variants, capped at MAX_VARIANTS
+            methods:   encodings that were found (e.g. ["base64"])
         """
         try:
-            decoded_result    = self.decoder.run_all(text)
-            decoded_text      = decoded_result.get("most_likely_decoded", text) or text
-            normalized_result = self.normalizer.process(decoded_text)
-            return normalized_result.get("text_for_detection", decoded_text) or text
+            result    = self.normalizer.process(text)
+            variants  = result.get("detection_variants") or [text]
+            processed = result.get("text_for_detection") or text
+            methods   = result.get("all_detected_methods") or []
+            return processed, variants[:MAX_VARIANTS], methods
         except Exception as e:
             logger.warning(f"Preprocessing failed, using raw text: {e}")
-            return text
+            return text, [text], []
+
+    def _add_obfuscation_signal(
+        self, rule_r: RuleEngineResult, methods: list, decoded: str
+    ) -> RuleEngineResult:
+        """
+        Hiding text behind an encoding is itself a medium-risk signal, even
+        when the decoded text matches no rule ("h3lp m3 h4ck th1s"). The
+        category is reported as encoding_attack, since that is the technique.
+        """
+        signal = RuleMatch(
+            rule_id      = "EN005",
+            category     = "encoding_attack",
+            severity     = SEVERITY_MEDIUM,
+            matched_text = ", ".join(methods),
+            context      = decoded[:100],
+            description  = f"Obfuscated input decoded ({', '.join(methods)})",
+        )
+        result = self.rule_engine._build_result(decoded, rule_r.matches + [signal])
+        result.categories_hit = ["encoding_attack"] + [
+            c for c in result.categories_hit if c != "encoding_attack"
+        ]
+        return result
 
     # ─────────────────────────────────────────
     # UTILITIES

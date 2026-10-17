@@ -1,37 +1,31 @@
 # configs/detection_config.yaml
+# Single source of truth for model settings, layer weights and thresholds.
+# RiskEngine reads `weights` and `thresholds`; training reads `model`.
 
 model:
   classifier: "distilbert-base-uncased"
   embedding: "all-mpnet-base-v2"
-  max_length: 512
+  max_length: 512          # long inputs keep the first 128 + last 382 tokens
   batch_size: 16
-  num_epochs: 20
+  num_epochs: 20           # early stopping (patience 2) usually ends sooner
   learning_rate: 2.0e-5
 
-thresholds:
-  block: 0.75
-  monitor: 0.45
-  embedding_similarity: 0.85
-  llm_judge_trigger_low: 0.40
-  llm_judge_trigger_high: 0.70
-
+# Weighted contribution of each layer to the final risk score (sum = 1.0)
 weights:
-  rule_engine: 0.30
+  rule_engine: 0.40
   ml_classifier: 0.35
-  embedding_matcher: 0.20
-  llm_judge: 0.15
+  embedding_matcher: 0.25
 
-llm_judge:
-  provider: "openai"
-  model: "gpt-3.5-turbo"
-  temperature: 0.0
-  max_tokens: 200
+# Final risk score thresholds
+thresholds:
+  block: 0.65
+  monitor: 0.35
 
 paths:
   raw_data: "data/raw"
   processed_data: "data/processed"
   models: "models"
-  results: "data/results/results.csv"
+  results: "data/results"
 
 labels:
   benign: 0
@@ -45,4 +39,3 @@ labels:
 api:
   host: "0.0.0.0"
   port: 8000
-  reload: true

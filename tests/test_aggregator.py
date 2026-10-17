@@ -24,11 +24,7 @@ from src.jailbreak_detection.aggregator.risk_engine import (
     RiskEngine,
     RiskResult,
     LayerBreakdown,
-    WEIGHT_RULE,
-    WEIGHT_ML,
-    WEIGHT_EMBEDDING,
     RISK_BLOCK_THRESHOLD,
-    RISK_MONITOR_THRESHOLD,
 )
 from src.jailbreak_detection.constants import (
     DECISION_BLOCK,

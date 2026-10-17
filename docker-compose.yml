@@ -11,8 +11,6 @@
 #   docker compose logs -f api  # stream API logs
 #   docker compose down         # stop everything
 
-version: "3.9"
-
 services:
 
   # ── Detection API ────────────────────────────
@@ -34,6 +32,7 @@ services:
       - HOST=0.0.0.0
       - PYTHONUNBUFFERED=1
       - HF_HUB_DISABLE_SYMLINKS_WARNING=1
+      - CORS_ORIGINS=http://localhost:8501
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c",
@@ -54,6 +53,5 @@ services:
     environment:
       - API_BASE=http://api:8000
     depends_on:
-      api:
-        condition: service_healthy
+      - api   # starts even if the API is degraded; the sidebar shows layer status
     restart: unless-stopped

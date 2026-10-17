@@ -8,11 +8,6 @@ The dashboard and any external clients consume these models.
 
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional
-from src.jailbreak_detection.constants import (
-    DECISION_BLOCK,
-    DECISION_MONITOR,
-    DECISION_ALLOW,
-)
 
 
 # ─────────────────────────────────────────────
@@ -41,13 +36,18 @@ class AnalyzeRequest(BaseModel):
         return v
 
 
+MAX_TEXT_CHARS  = 10_000
+MAX_BATCH_TEXTS = 20
+MAX_BATCH_CHARS = 50_000
+
+
 class BatchAnalyzeRequest(BaseModel):
-    """Batch analysis request — up to 50 texts at once."""
+    """Batch analysis request — up to 20 texts, 50,000 characters in total."""
     texts: list[str] = Field(
         ...,
         min_length=1,
-        max_length=50,
-        description="List of texts to analyze (max 50)",
+        max_length=MAX_BATCH_TEXTS,
+        description=f"List of texts to analyze (max {MAX_BATCH_TEXTS})",
     )
     include_breakdown: bool = Field(default=False)
 
@@ -59,6 +59,10 @@ class BatchAnalyzeRequest(BaseModel):
         for i, t in enumerate(v):
             if not isinstance(t, str) or not t.strip():
                 raise ValueError(f"texts[{i}] must be a non-empty string")
+            if len(t) > MAX_TEXT_CHARS:
+                raise ValueError(f"texts[{i}] is longer than {MAX_TEXT_CHARS} characters")
+        if sum(len(t) for t in v) > MAX_BATCH_CHARS:
+            raise ValueError(f"batch is longer than {MAX_BATCH_CHARS} characters in total")
         return v
 
 

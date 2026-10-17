@@ -18,8 +18,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy and install dependencies first (layer cache)
 COPY requirements.txt .
+# CPU build of PyTorch (~200 MB) instead of the default CUDA build (~2 GB)
 RUN pip install --upgrade pip && \
-    pip install --prefix=/install --no-cache-dir -r requirements.txt
+    pip install --prefix=/install --no-cache-dir \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        -r requirements.txt
 
 
 # ─────────────────────────────────────────────
@@ -38,10 +41,11 @@ COPY --from=builder /install /usr/local
 # Copy application code
 COPY src/           src/
 COPY configs/       configs/
-COPY models/        models/
 
-# Create data directories
-RUN mkdir -p data/processed data/results logs && \
+# Trained models are NOT baked into the image (they are gitignored, so a
+# CI build would silently ship without them). docker-compose mounts
+# ./models read-only; /health returns 503 if a layer failed to load.
+RUN mkdir -p models data/processed data/results logs && \
     chown -R appuser:appuser /app
 
 # Environment

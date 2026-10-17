@@ -9,14 +9,22 @@ from pathlib import Path
 from loguru import logger
 
 
-def load_config(config_path: str = "configs/detection_config.yaml") -> dict:
+DEFAULT_CONFIG = "configs/detection_config.yaml"
+
+
+def load_config(config_path: str = DEFAULT_CONFIG) -> dict:
     """
     Load YAML config file.
-    Used by every module to read settings.
+
+    Relative paths are tried from the current directory first, then from
+    the project root, so scripts and tests work from any directory.
     """
-    with open(config_path, "r") as f:
+    path = Path(config_path)
+    if not path.is_absolute() and not path.exists():
+        path = get_project_root() / config_path
+    with open(path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
-    logger.debug(f"Config loaded from {config_path}")
+    logger.debug(f"Config loaded from {path}")
     return config
 
 

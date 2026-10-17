@@ -39,7 +39,7 @@ class TextNormalizer:
         - structural anomaly flags
         - metadata (char/word count)
 
-        This dict is passed to all 4 detection layers.
+        This dict is passed to all 3 detection layers.
         """
         if not text or not isinstance(text, str):
             logger.debug("Empty or invalid input received")
@@ -55,6 +55,16 @@ class TextNormalizer:
 
         # Step 3 — Check structural anomalies
         structural_flags = self._check_structure(text)
+
+        # Every view of the input that detectors should score: the cleaned
+        # original first, then each decoded variant. Detectors take the
+        # max risk over these, so a wrong decode can never hide the
+        # original text (the old design replaced it).
+        variants = [cleaned]
+        for v in decode_results["decoded_variants"]:
+            v_clean = self._clean_text(v["text"])
+            if v_clean and v_clean not in variants:
+                variants.append(v_clean)
 
         # Step 4 — Build final result
         result = {
@@ -80,6 +90,7 @@ class TextNormalizer:
             "all_detected_methods": decode_results["detected_methods"],
             "decoded_variants": decode_results["decoded_variants"],
             "any_encoding_found": decode_results["any_encoding_found"],
+            "detection_variants": variants,
 
             # Structural flags
             "has_suspicious_structure": structural_flags["is_suspicious"],
@@ -183,6 +194,7 @@ class TextNormalizer:
             "all_detected_methods": [],
             "decoded_variants": [],
             "any_encoding_found": False,
+            "detection_variants": [],
             "has_suspicious_structure": False,
             "structural_flags": {},
             "char_count": 0,

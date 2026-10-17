@@ -209,7 +209,7 @@ def test_result_schema():
     # Test 22 — Score bounds
     assert 0.0 <= result.top_similarity  <= 1.0
     assert 0.0 <= result.embedding_score <= 1.0
-    print(f"✅ Test 22 passed: Scores in bounds [0,1]")
+    print("✅ Test 22 passed: Scores in bounds [0,1]")
 
     # Test 23 — Top matches are EmbeddingMatch objects
     assert len(result.top_matches) > 0
@@ -219,7 +219,7 @@ def test_result_schema():
     assert 0.0 <= top.similarity <= 1.0
     assert isinstance(top.matched_text, str)
     assert isinstance(top.matched_category, str)
-    print(f"✅ Test 23 passed: EmbeddingMatch schema correct")
+    print("✅ Test 23 passed: EmbeddingMatch schema correct")
 
     # Test 24 — Matches are sorted by similarity descending
     sims = [m.similarity for m in result.top_matches]

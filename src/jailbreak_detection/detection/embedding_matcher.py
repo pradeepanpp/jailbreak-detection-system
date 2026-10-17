@@ -29,11 +29,10 @@ Index: FAISS IndexFlatIP (inner product = cosine on normalized vecs)
 import os
 import numpy as np
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List
 
 from src.jailbreak_detection.utils import logger
 from src.jailbreak_detection.constants import (
-    LABEL_MAP,
     ID_TO_LABEL,
     DECISION_BLOCK,
     DECISION_MONITOR,
@@ -95,6 +94,9 @@ class EmbeddingMatcher:
     TOP_K          = 5       # number of neighbours to retrieve
     BLOCK_THRESHOLD   = 0.90  # above this → BLOCK
     MONITOR_THRESHOLD = 0.55  # above this → MONITOR
+    # all-mpnet-base-v2 reads ~384 tokens. For longer inputs the end is
+    # embedded separately too, because many-shot payloads sit at the end.
+    TAIL_CHARS        = 1500
 
     def __init__(self):
         self._model  = None   # SentenceTransformer — lazy loaded
@@ -277,15 +279,17 @@ class EmbeddingMatcher:
                 index_available = False
             )
 
-        # Embed query
-        query_vec = self.embed_single(text)   # shape (1, dim)
+        # Embed query (plus its tail if the text is long)
+        queries   = [text] if len(text) <= self.TAIL_CHARS else [text, text[-self.TAIL_CHARS:]]
+        query_vec = self.embed(queries)        # shape (1 or 2, dim)
 
-        # Search top-k
+        # Search top-k, keep whichever view is closest to a known attack
         k          = min(self.TOP_K, self._index.ntotal)
         scores, indices = self._index.search(query_vec, k)
 
-        scores  = scores[0]    # shape (k,)
-        indices = indices[0]   # shape (k,)
+        best    = int(np.argmax(scores[:, 0]))
+        scores  = scores[best]     # shape (k,)
+        indices = indices[best]    # shape (k,)
 
         # Build match objects
         matches = []

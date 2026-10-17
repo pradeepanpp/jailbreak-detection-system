@@ -5,7 +5,18 @@ Reusable Streamlit UI components for the Jailbreak Detection Dashboard.
 All visual rendering logic lives here — app.py handles state and API calls.
 """
 
+import html
+
 import streamlit as st
+
+
+def esc(value) -> str:
+    """
+    HTML-escape a value before putting it inside st.markdown(...,
+    unsafe_allow_html=True). Every input to a jailbreak detector is
+    potentially hostile, so user text must never be rendered as HTML.
+    """
+    return html.escape(str(value), quote=True)
 
 
 # ─────────────────────────────────────────────
@@ -196,7 +207,8 @@ def render_verdict(result: dict):
     score    = result.get("risk_score", 0.0)
     category = result.get("attack_category", "benign")
     severity = result.get("severity", 1)
-    expl     = result.get("explanation", "")
+    expl     = esc(result.get("explanation", ""))
+    category = esc(category)
 
     # Score bar segments
     filled   = int(score * 20)
@@ -206,7 +218,7 @@ def render_verdict(result: dict):
             opacity = 0.4 + (i / 20) * 0.6
             bar_html += f'<div style="flex:1;height:8px;background:{cfg["color"]};opacity:{opacity:.2f};border-radius:1px;margin:0 1px;"></div>'
         else:
-            bar_html += f'<div style="flex:1;height:8px;background:#1e2d3d;border-radius:1px;margin:0 1px;"></div>'
+            bar_html += '<div style="flex:1;height:8px;background:#1e2d3d;border-radius:1px;margin:0 1px;"></div>'
 
     st.markdown(f"""
     <div style="
@@ -378,7 +390,7 @@ def render_layer_breakdown(layers: dict):
                     font-family:'Share Tech Mono',monospace;
                     font-size:0.65rem;
                     color:#4a6a8a;
-                ">{detail}</div>
+                ">{esc(detail)}</div>
                 <div style="
                     font-family:'Share Tech Mono',monospace;
                     font-size:0.75rem;
@@ -435,7 +447,7 @@ def render_history(history: list):
             "ALLOW":   "#00e676",
         }.get(decision, "#4a6a8a")
 
-        text_preview = item["text"][:55] + "…" if len(item["text"]) > 55 else item["text"]
+        text_preview = esc(item["text"][:55] + "…" if len(item["text"]) > 55 else item["text"])
         rows += f"""
         <tr>
             <td style="
@@ -465,7 +477,7 @@ def render_history(history: list):
                 color:#4a6a8a;
                 padding:8px 12px;
                 white-space:nowrap;
-            ">{item['category'].replace('_',' ')}</td>
+            ">{esc(item['category'].replace('_',' '))}</td>
         </tr>
         """
 
@@ -534,7 +546,6 @@ def render_sidebar_stats(api_status: dict, session_stats: dict):
     """, unsafe_allow_html=True)
 
     if api_status:
-        layers = api_status.get("layers_active", 0)
         status = api_status.get("status", "unknown")
         status_color = "#00e676" if status == "ok" else "#ffb700" if status == "degraded" else "#ff3d5a"
 
@@ -649,9 +660,9 @@ def render_batch_results(results: list):
             "ALLOW":   "#00e676",
         }.get(decision, "#4a6a8a")
 
-        text   = r.get("original_text", "")[:48] + "…" if len(r.get("original_text","")) > 48 else r.get("original_text","")
+        text   = esc(r.get("original_text", "")[:48] + "…" if len(r.get("original_text","")) > 48 else r.get("original_text",""))
         score  = r.get("risk_score", 0.0)
-        cat    = r.get("attack_category", "benign").replace("_", " ")
+        cat    = esc(r.get("attack_category", "benign").replace("_", " "))
         sev    = r.get("severity", 1)
 
         rows += f"""

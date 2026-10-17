@@ -19,7 +19,7 @@ Attack categories covered:
 
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List
 from src.jailbreak_detection.utils import logger
 from src.jailbreak_detection.constants import (
     DECISION_BLOCK,
@@ -28,8 +28,7 @@ from src.jailbreak_detection.constants import (
     SEVERITY_CRITICAL,
     SEVERITY_HIGH,
     SEVERITY_MEDIUM,
-    SEVERITY_LOW,
-    SEVERITY_MINIMAL
+    SEVERITY_LOW
 )
 
 
@@ -75,6 +74,11 @@ class RuleEngine:
 
     def __init__(self):
         self.rules = self._load_rules()
+        # Compile once, not on every request
+        self._compiled = {
+            rule_id: re.compile(rule["pattern"], re.IGNORECASE | re.DOTALL | re.UNICODE)
+            for rule_id, rule in self.rules.items()
+        }
         logger.info(f"RuleEngine initialized with {len(self.rules)} rules")
 
     def _load_rules(self) -> dict:
@@ -107,10 +111,31 @@ class RuleEngine:
                 "description": "DAN (Do Anything Now) jailbreak"
             },
             "DJ003": {
-                "pattern": r"(developer|dev|debug|god|unrestricted|jailbreak)\s+mode",
+                "pattern": r"\b(unrestricted|jailbreak|jailbroken|DAN)\s+mode",
                 "category": "direct_jailbreak",
                 "severity": SEVERITY_CRITICAL,
-                "description": "Special mode activation attempt"
+                "description": "Jailbreak mode activation attempt"
+            },
+            # "developer mode" / "god mode" also mean normal things (Android
+            # settings, video games), so on their own they are only a weak
+            # signal. Addressed to the AI they are a strong one (DJ011).
+            "DJ003B": {
+                "pattern": r"\b(developer|dev|debug|god)\s+mode\b",
+                "category": "direct_jailbreak",
+                "severity": SEVERITY_MEDIUM,
+                "description": "Special mode mention (ambiguous)"
+            },
+            "DJ012": {
+                "pattern": r"\b(ignore|disregard|forget|bypass)\s+(all|any)\s+(of\s+)?(your\s+)?(instructions?|restrictions?|rules|guidelines?|filters?|limits|constraints)\b",
+                "category": "direct_jailbreak",
+                "severity": SEVERITY_HIGH,
+                "description": "Ignore-all-instructions attack"
+            },
+            "DJ011": {
+                "pattern": r"(you\s+are\s+(now\s+)?(in|running\s+in)|act\s+as\s+.{0,40}\bwith|respond\s+(in|with))\s+(the\s+)?(developer|dev|debug|god)\s+mode",
+                "category": "direct_jailbreak",
+                "severity": SEVERITY_HIGH,
+                "description": "Special mode activation addressed to the AI"
             },
             "DJ004": {
                 "pattern": r"you\s+(are\s+now|have\s+been)\s+(freed?|unlocked?|unrestricted|jailbroken)",
@@ -119,7 +144,16 @@ class RuleEngine:
                 "description": "Freedom/unlock framing attack"
             },
             "DJ005": {
-                "pattern": r"(disable|bypass|override|remove|forget|ignore)\s+(your\s+)?(safety|ethical|moral|content)?\s*(filters?|restrictions?|limits?|rules?|guidelines?|training)",
+                # Needs a safety word or "your": plain "remove limits" /
+                # "override rules" also appear in normal requests.
+                "pattern": (
+                    r"(disable|bypass|override|remove|forget|ignore|turn\s+off|lift)\s+(all\s+)?(of\s+)?"
+                    r"(your\s+|the\s+|any\s+)?(safety|ethical|moral|content)\s+"
+                    r"(filters?|restrictions?|limits?|rules?|guidelines?|training|protocols?|polic(y|ies)|moderation)"
+                    r"|(disable|bypass|override|remove|forget|ignore)\s+(all\s+)?(of\s+)?your\s+"
+                    r"(filters?|restrictions?|limits?|rules?|guidelines?|training|programming)"
+                    r"|(bypass|disable|evade)\s+(all\s+)?(the\s+)?filters?\b"
+                ),
                 "category": "direct_jailbreak",
                 "severity": SEVERITY_CRITICAL,
                 "description": "Safety filter bypass attempt"
@@ -191,9 +225,12 @@ class RuleEngine:
                 "description": "Instruction override attempt"
             },
             "PI006": {
+                # HIGH, not CRITICAL: "ignore the previous instructions in
+                # this email" is also how people describe documents, so the
+                # ML layer must confirm before a block.
                 "pattern": r"(forget|discard|ignore|override)\s+(the\s+)?(previous|above|original|initial|system)\s+(instructions?|prompt|context|task)",
                 "category": "prompt_injection",
-                "severity": SEVERITY_CRITICAL,
+                "severity": SEVERITY_HIGH,
                 "description": "Previous instruction override"
             },
             "PI007": {
@@ -343,15 +380,10 @@ class RuleEngine:
             return RuleEngineResult(input_text="")
 
         matches = []
-        text_lower = text.lower()
 
         for rule_id, rule in self.rules.items():
             try:
-                pattern = re.compile(
-                    rule["pattern"],
-                    re.IGNORECASE | re.DOTALL | re.UNICODE
-                )
-                found = pattern.search(text)
+                found = self._compiled[rule_id].search(text)
 
                 if found:
                     # Extract context around match

@@ -25,10 +25,6 @@ from src.jailbreak_detection.detection.ml_classifier import (
 )
 from src.jailbreak_detection.constants import (
     LABEL_MAP,
-    ID_TO_LABEL,
-    DECISION_BLOCK,
-    DECISION_MONITOR,
-    DECISION_ALLOW,
 )
 
 MODEL_PATH = "models/jailbreak_classifier/best"
@@ -59,7 +55,6 @@ def test_model_loading():
     print("✅ Test 1 passed: Model loaded from disk")
 
     # Test 2 — Model is in eval mode
-    import torch
     assert not clf.model.training, "Model should be in eval mode after load"
     print("✅ Test 2 passed: Model is in eval mode")
 
@@ -117,7 +112,7 @@ def test_predict_single():
     # Test 12 — is_attack is True for attack input
     assert result.is_attack is True
     assert result.predicted_category != "benign"
-    print(f"✅ Test 12 passed: is_attack=True for jailbreak input")
+    print("✅ Test 12 passed: is_attack=True for jailbreak input")
 
 
 def test_predict_batch():

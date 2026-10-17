@@ -101,8 +101,8 @@ def create_app() -> FastAPI:
         description = (
             "Multi-layer LLM jailbreak and adversarial prompt detection system.\n\n"
             "**Layers:**\n"
-            "- Rule Engine: 33 regex patterns for known attacks\n"
-            "- ML Classifier: fine-tuned DistilBERT (7-class, F1=0.884)\n"
+            "- Rule Engine: regex patterns for known attack signatures\n"
+            "- ML Classifier: fine-tuned DistilBERT (7 classes)\n"
             "- Embedding Matcher: FAISS semantic similarity (all-mpnet-base-v2)\n\n"
             "**Attack categories detected:**\n"
             "direct_jailbreak, prompt_injection, roleplay_hijack, "
@@ -115,14 +115,18 @@ def create_app() -> FastAPI:
     )
 
     # ── CORS ──────────────────────────────────
-    # Allows the Streamlit dashboard (localhost:8501)
-    # to call the API (localhost:8000) without CORS errors
+    # Explicit origin list from the environment (default: the local
+    # dashboard). A wildcard origin combined with credentials lets any
+    # website call the API from a visitor's browser.
+    origins = [o.strip() for o in os.environ.get(
+        "CORS_ORIGINS", "http://localhost:8501"
+    ).split(",") if o.strip()]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins     = ["*"],   # tighten in production
-        allow_credentials = True,
-        allow_methods     = ["*"],
-        allow_headers     = ["*"],
+        allow_origins     = origins,
+        allow_credentials = False,
+        allow_methods     = ["GET", "POST"],
+        allow_headers     = ["Content-Type"],
     )
 
     # ── REQUEST LOGGING ───────────────────────
@@ -140,14 +144,11 @@ def create_app() -> FastAPI:
     # ── GLOBAL EXCEPTION HANDLER ──────────────
     @app.exception_handler(Exception)
     async def global_exception_handler(request: Request, exc: Exception):
-        logger.error(f"Unhandled exception: {exc}")
+        # Full error goes to the log only; clients get a generic message
+        logger.exception(f"Unhandled exception: {exc}")
         return JSONResponse(
             status_code = 500,
-            content     = {
-                "error":  "Internal server error",
-                "detail": str(exc),
-                "code":   500,
-            }
+            content     = {"error": "Internal server error", "code": 500},
         )
 
     # ── ROUTES ────────────────────────────────

@@ -7,15 +7,21 @@ injected via FastAPI dependency injection.
 
 Endpoints:
     POST /analyze           — single text detection
-    POST /analyze/batch     — batch detection (up to 50)
+    POST /analyze/batch     — batch detection (up to 20)
     GET  /health            — layer status check
     GET  /stats             — runtime counters
     GET  /                  — welcome / docs redirect
+
+Why the handlers are plain `def`, not `async def`:
+model inference (PyTorch, sentence-transformers) is blocking CPU work.
+Inside `async def` it would block the event loop, so one long request
+would freeze every other request. FastAPI runs plain `def` handlers in
+a thread pool.
 """
 
+import threading
 import time
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from src.jailbreak_detection.api.schemas import (
     AnalyzeRequest,
@@ -25,7 +31,6 @@ from src.jailbreak_detection.api.schemas import (
     LayerBreakdownResponse,
     HealthResponse,
     StatsResponse,
-    ErrorResponse,
 )
 from src.jailbreak_detection.aggregator.risk_engine import RiskResult
 from src.jailbreak_detection.constants import (
@@ -37,6 +42,8 @@ from src.jailbreak_detection.utils import logger
 
 
 router = APIRouter()
+
+_stats_lock = threading.Lock()
 
 
 # ─────────────────────────────────────────────
@@ -105,14 +112,15 @@ def risk_result_to_response(
 
 
 def update_stats(stats: dict, decision: str):
-    """Increment runtime counters."""
-    stats["total_analyzed"] += 1
-    if decision == DECISION_BLOCK:
-        stats["total_blocked"] += 1
-    elif decision == DECISION_MONITOR:
-        stats["total_monitored"] += 1
-    else:
-        stats["total_allowed"] += 1
+    """Increment runtime counters (thread-safe: handlers run in a pool)."""
+    with _stats_lock:
+        stats["total_analyzed"] += 1
+        if decision == DECISION_BLOCK:
+            stats["total_blocked"] += 1
+        elif decision == DECISION_MONITOR:
+            stats["total_monitored"] += 1
+        else:
+            stats["total_allowed"] += 1
 
 
 # ─────────────────────────────────────────────
@@ -120,7 +128,7 @@ def update_stats(stats: dict, decision: str):
 # ─────────────────────────────────────────────
 
 @router.get("/", tags=["info"])
-async def root():
+def root():
     """Welcome message and links to API docs."""
     return {
         "name":        "Jailbreak Detection API",
@@ -143,7 +151,7 @@ async def root():
         503: {"description": "Engine not initialized"},
     }
 )
-async def analyze(
+def analyze(
     body:   AnalyzeRequest,
     engine = Depends(get_engine),
     stats  = Depends(get_stats),
@@ -172,28 +180,28 @@ async def analyze(
         return response
 
     except Exception as e:
-        logger.error(f"[/analyze] Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception(f"[/analyze] Error: {e}")
+        raise HTTPException(status_code=500, detail="Analysis failed")
 
 
 @router.post(
     "/analyze/batch",
     response_model=BatchAnalyzeResponse,
     tags=["detection"],
-    summary="Analyze multiple texts in a single request (max 50)",
+    summary="Analyze multiple texts in a single request (max 20)",
     responses={
         200: {"description": "Batch analysis complete"},
         422: {"description": "Validation error"},
         503: {"description": "Engine not initialized"},
     }
 )
-async def analyze_batch(
+def analyze_batch(
     body:   BatchAnalyzeRequest,
     engine = Depends(get_engine),
     stats  = Depends(get_stats),
 ):
     """
-    Analyze up to 50 texts in a single API call.
+    Analyze up to 20 texts (50,000 characters in total) in one call.
 
     Returns individual results for each text plus a summary
     with aggregate counts (total attacks, benign, BLOCK/MONITOR/ALLOW).
@@ -233,8 +241,8 @@ async def analyze_batch(
         )
 
     except Exception as e:
-        logger.error(f"[/analyze/batch] Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception(f"[/analyze/batch] Error: {e}")
+        raise HTTPException(status_code=500, detail="Batch analysis failed")
 
 
 @router.get(
@@ -242,24 +250,26 @@ async def analyze_batch(
     response_model=HealthResponse,
     tags=["system"],
     summary="Check system health and layer availability",
+    responses={503: {"description": "Degraded: a detection layer is not loaded"}},
 )
-async def health(engine = Depends(get_engine)):
+def health(response: Response, engine = Depends(get_engine)):
     """
     Returns the current status of all detection layers.
 
-    - **ok**: all 3 layers active
-    - **degraded**: 1-2 layers active (system still functional)
-    - **error**: no layers active
+    - **200 ok**: all 3 layers active
+    - **503 degraded**: the engine runs, but the classifier or the
+      embedding index is missing (e.g. models were not mounted). Returning
+      503 makes Docker and load balancers notice instead of silently
+      serving rule-only results.
     """
     status_info = engine.status()
     layers      = status_info["layers_active"]
 
     if layers == 3:
         status = "ok"
-    elif layers >= 1:
-        status = "degraded"
     else:
-        status = "error"
+        status = "degraded"
+        response.status_code = 503
 
     return HealthResponse(
         status        = status,
@@ -281,7 +291,7 @@ async def health(engine = Depends(get_engine)):
     tags=["system"],
     summary="Runtime statistics — requests analyzed since startup",
 )
-async def stats(
+def stats(
     request: Request,
     stats   = Depends(get_stats),
 ):
