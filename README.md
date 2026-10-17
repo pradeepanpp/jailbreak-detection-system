@@ -11,7 +11,6 @@ Detect jailbreak and prompt-injection attempts before they reach a language mode
 
 </div>
 
-## At a glance
 
 **Problem.** Applications built on LLMs receive prompts that try to override their instructions: "ignore all previous instructions", fake system messages, role-play framing, encoded payloads, many-shot examples and instructions hidden inside documents. Keyword filters miss reworded attacks and also block normal users who happen to use words like "ignore" or "developer mode".
 
