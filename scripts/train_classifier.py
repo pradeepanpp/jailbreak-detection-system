@@ -79,6 +79,12 @@ class WeightedLossTrainer(Trainer):
         self.class_weights = class_weights.to(
             next(self.model.parameters()).device
         )
+        # Our loss is a plain per-batch mean, not normalised by the number of
+        # items across accumulation steps. Without this flag the Trainer sees
+        # that DistilBERT.forward accepts **kwargs, assumes the loss is already
+        # scaled, and skips dividing by gradient_accumulation_steps — gradients
+        # (and the logged loss) come out 4x too large.
+        self.model_accepts_loss_kwargs = False
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels  = inputs.pop("labels")
@@ -197,7 +203,7 @@ def print_split_distribution(df: pd.DataFrame, name: str):
         logger.info(f"    [{label_id}] {label_name:<22} {count:>4}  {bar}")
 
 
-def get_training_args(config: dict, device: torch.device) -> TrainingArguments:
+def get_training_args(config: dict, device: torch.device, n_train: int) -> TrainingArguments:
     """
     Build TrainingArguments.
     CPU-safe: no fp16, smaller batch, gradient accumulation to compensate.
@@ -209,6 +215,10 @@ def get_training_args(config: dict, device: torch.device) -> TrainingArguments:
     batch_size = config["model"]["batch_size"] if on_gpu else 8
     grad_accum = 1 if on_gpu else 4
 
+    # 10% warmup, given as steps (warmup_ratio is deprecated in transformers 5)
+    steps_per_epoch = -(-n_train // (batch_size * grad_accum))
+    warmup_steps    = max(1, int(0.1 * steps_per_epoch * config["model"]["num_epochs"]))
+
     return TrainingArguments(
         output_dir                  = SAVE_PATH,
         num_train_epochs            = config["model"]["num_epochs"],
@@ -216,14 +226,13 @@ def get_training_args(config: dict, device: torch.device) -> TrainingArguments:
         per_device_eval_batch_size  = batch_size * 2,
         gradient_accumulation_steps = grad_accum,
         learning_rate               = float(config["model"]["learning_rate"]),
-        warmup_ratio                = 0.1,
+        warmup_steps                = warmup_steps,
         weight_decay                = 0.01,
         eval_strategy               = "epoch",
         save_strategy               = "epoch",
         load_best_model_at_end      = True,
         metric_for_best_model       = "f1",
         greater_is_better           = True,
-        logging_dir                 = "logs/trainer",
         logging_steps               = 10,
         fp16                        = on_gpu,       # CPU does not support fp16
         dataloader_num_workers      = 0,            # Windows-safe
@@ -366,7 +375,7 @@ def main():
     logger.info(f"Val dataset  : {len(val_dataset)} samples tokenized")
 
     # ── 6. Training arguments ─────────────────────────
-    training_args = get_training_args(config, device)
+    training_args = get_training_args(config, device, len(train_df))
 
     logger.info("\nTraining config:")
     logger.info(f"  Epochs         : {training_args.num_train_epochs}")
