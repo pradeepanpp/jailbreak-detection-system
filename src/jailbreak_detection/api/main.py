@@ -56,8 +56,9 @@ async def lifespan(app: FastAPI):
             load_classifier = True,
             load_embedding  = True,
         )
+        app.state.engine.warm_up()   # first real request should not pay model-loading cost
         status = app.state.engine.status()
-        logger.info(f"RiskEngine loaded in {time.time() - t0:.1f}s")
+        logger.info(f"RiskEngine loaded and warmed up in {time.time() - t0:.1f}s")
         logger.info(f"Active layers: {status['layers_active']}/3")
 
         if status["layers_active"] < 3:

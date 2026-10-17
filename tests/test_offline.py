@@ -195,6 +195,18 @@ def test_high_rule_plus_ml_confirmation_blocks():
     assert r.override_applied in ("HIGH_RULE_ML_CONFIRM", "CRITICAL_RULE")
 
 
+def test_warm_up_runs_without_models(rule_only):
+    rule_only.warm_up()   # must not raise, even with only the rule layer
+
+
+def test_benign_block_and_monitor_rates_are_reported(ds):
+    ev = _load_script("evaluate")
+    fake = [SimpleNamespace(decision=d) for d in ("BLOCK", "MONITOR", "ALLOW", "ALLOW", "BLOCK")]
+    m = ev.compute_binary_metrics(["benign", "benign", "benign", "benign", "direct_jailbreak"], fake)
+    assert m["benign_block_rate"] == 0.25 and m["benign_monitor_rate"] == 0.25
+    assert m["false_positive_rate"] == 0.5
+
+
 def test_weights_and_thresholds_come_from_config():
     cfg = load_config()
     assert re_mod.WEIGHT_RULE == cfg["weights"]["rule_engine"]

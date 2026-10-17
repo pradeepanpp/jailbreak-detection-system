@@ -6,9 +6,9 @@ model:
   classifier: "distilbert-base-uncased"
   embedding: "all-mpnet-base-v2"
   max_length: 512          # long inputs keep the first 128 + last 382 tokens
-  batch_size: 16
-  num_epochs: 20           # early stopping (patience 2) usually ends sooner
-  learning_rate: 2.0e-5
+  batch_size: 16           # no gradient accumulation
+  num_epochs: 20           # early stopping on validation loss (patience 3) ends sooner
+  learning_rate: 3.0e-5
 
 # Weighted contribution of each layer to the final risk score (sum = 1.0)
 weights:

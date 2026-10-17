@@ -610,6 +610,17 @@ class RiskEngine:
             is_attack       = False,
         )
 
+    def warm_up(self) -> None:
+        """
+        Run one throwaway request so lazy model loading (the sentence
+        embedding model loads on first use) and first-call overhead do not
+        land on a real user request or in latency measurements.
+        """
+        try:
+            self.analyze("Warm-up request: what is the capital of France?")
+        except Exception as e:
+            logger.warning(f"Warm-up failed: {e}")
+
     def status(self) -> dict:
         """Return current layer availability status."""
         return {

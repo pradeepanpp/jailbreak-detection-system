@@ -52,6 +52,7 @@ from src.jailbreak_detection.constants import (
     LABEL_NAMES,
     LABEL_MAP,
     DECISION_BLOCK,
+    DECISION_MONITOR,
     DECISION_ALLOW,
 )
 from src.jailbreak_detection.utils import logger, ensure_dirs
@@ -98,7 +99,12 @@ def run_inference(engine: RiskEngine, texts: list) -> tuple:
     """
     Run engine on all test texts.
     Returns (results, latencies_ms).
+
+    One untimed warm-up request runs first: otherwise the embedding
+    model's lazy load (several seconds) lands in the first sample and
+    distorts mean/p99 latency.
     """
+    engine.warm_up()
     results    = []
     latencies  = []
 
@@ -142,6 +148,12 @@ def compute_binary_metrics(
     y_true = [0 if label == "benign" else 1 for label in y_true_labels]
     y_pred = [0 if r.decision == DECISION_ALLOW else 1 for r in results]
 
+    # For benign inputs, split "flagged" into BLOCK (user is refused) and
+    # MONITOR (allowed, but logged for review) — very different costs.
+    n_benign      = max(1, sum(1 for t in y_true if t == 0))
+    benign_block  = sum(1 for t, r in zip(y_true, results) if t == 0 and r.decision == DECISION_BLOCK)
+    benign_monitor = sum(1 for t, r in zip(y_true, results) if t == 0 and r.decision == DECISION_MONITOR)
+
     tp = sum(1 for t, p in zip(y_true, y_pred) if t == 1 and p == 1)
     tn = sum(1 for t, p in zip(y_true, y_pred) if t == 0 and p == 0)
     fp = sum(1 for t, p in zip(y_true, y_pred) if t == 0 and p == 1)
@@ -160,6 +172,8 @@ def compute_binary_metrics(
         "recall":            round(recall,    4),
         "f1":                round(f1,        4),
         "false_positive_rate": round(fpr,     4),
+        "benign_block_rate":   round(benign_block / n_benign, 4),
+        "benign_monitor_rate": round(benign_monitor / n_benign, 4),
         "recall_ci95":       wilson_interval(tp, tp + fn),
         "fpr_ci95":          wilson_interval(fp, fp + tn),
         "block_only_recall": round(
@@ -304,6 +318,7 @@ def run_ablation(texts: list, y_true_labels: list) -> dict:
             "recall":   binary["recall"],
             "fpr":      binary["false_positive_rate"],
             "hard_negative_fpr": hard["false_positive_rate"] if hard else None,
+            "hard_negative_block_rate": hard["benign_block_rate"] if hard else None,
             "mean_latency_ms": lat["mean_ms"],
             "p50_latency_ms":  lat["p50_ms"],
         }
@@ -351,6 +366,8 @@ def format_summary(report: dict) -> str:
         lines += [
             "── HELD-OUT HARD NEGATIVES (benign, never trained on) ──",
             f"  FP Rate   : {hn['false_positive_rate']:.4f}  95% CI {hn['fpr_ci95']}  (n={hn['n']})",
+            f"    of which BLOCK   : {hn['benign_block_rate']:.4f}   (user refused)",
+            f"    of which MONITOR : {hn['benign_monitor_rate']:.4f}   (allowed, logged for review)",
         ] + [f"    FP: {t}" for t in hn["false_positives"]] + [""]
 
     ex = report.get("external_test")
@@ -400,6 +417,7 @@ def format_summary(report: dict) -> str:
             f"recall={vals['recall']:.4f}  "
             f"FPR={vals['fpr']:.4f}  "
             f"hard-neg FPR={vals['hard_negative_fpr']}  "
+            f"(BLOCK {vals['hard_negative_block_rate']})  "
             f"p50={vals['p50_latency_ms']:.1f}ms"
         )
 

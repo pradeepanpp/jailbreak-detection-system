@@ -19,6 +19,7 @@ Requirements:
   data/processed/test.csv
 """
 
+import argparse
 import sys
 import os
 sys.path.append(".")
@@ -123,15 +124,22 @@ def load_splits() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     return train_df, val_df, test_df
 
 
-def compute_weights(train_df: pd.DataFrame) -> torch.Tensor:
+def compute_weights(train_df: pd.DataFrame, binary_balanced: bool = True) -> torch.Tensor:
     """
-    Compute inverse-frequency class weights from training labels.
+    Class weights that are balanced at BOTH levels:
 
-    Example for our dataset:
-      direct_jailbreak = 84 samples → low weight
-      encoding_attack  = 22 samples → high weight
+    1. Within attacks: every attack class gets the same total weight
+       (sklearn "balanced", inverse frequency).
+    2. Benign vs attack: benign gets as much total weight as all six
+       attack classes combined.
 
-    sklearn's compute_class_weight handles this automatically.
+    Plain "balanced" weighting gives each of the 7 classes 1/7 of the
+    loss, so attacks as a group get 6/7 and benign only 1/7. That pushes
+    every borderline input toward "attack". Scaling the
+    benign weight by the number of attack classes restores a 50/50
+    benign-vs-attack balance while keeping the attack classes balanced.
+    (The weighted cross-entropy normalises by the weight sum, so only
+    the ratios matter.)
     """
     labels  = train_df["label"].values
     classes = np.arange(NUM_LABELS)
@@ -141,6 +149,9 @@ def compute_weights(train_df: pd.DataFrame) -> torch.Tensor:
         classes=classes,
         y=labels
     )
+    if binary_balanced:
+        weights[LABEL_MAP["benign"]] *= (NUM_LABELS - 1)
+    logger.info(f"Weighting: {'binary-balanced' if binary_balanced else 'per-class balanced'}")
 
     weight_tensor = torch.tensor(weights, dtype=torch.float32)
 
@@ -206,36 +217,35 @@ def print_split_distribution(df: pd.DataFrame, name: str):
 def get_training_args(config: dict, device: torch.device, n_train: int) -> TrainingArguments:
     """
     Build TrainingArguments.
-    CPU-safe: no fp16, smaller batch, gradient accumulation to compensate.
+
+    With only ~275 training samples every update counts: batch 16 and no
+    gradient accumulation gives 18 updates per epoch (batch 8 x accum 4
+    gave only 9). Warm-up is one epoch, and the best checkpoint is chosen
+    by validation loss: on 61 validation samples F1 stays flat while the
+    model still predicts mostly "benign", so early stopping on F1 stopped
+    training before it had learned anything.
     """
-    on_gpu = (device.type == "cuda")
-
-    # On CPU: batch_size=8, grad_accum=4 → effective batch=32
-    # This is stable and won't OOM on CPU
-    batch_size = config["model"]["batch_size"] if on_gpu else 8
-    grad_accum = 1 if on_gpu else 4
-
-    # 10% warmup, given as steps (warmup_ratio is deprecated in transformers 5)
-    steps_per_epoch = -(-n_train // (batch_size * grad_accum))
-    warmup_steps    = max(1, int(0.1 * steps_per_epoch * config["model"]["num_epochs"]))
+    on_gpu     = device.type == "cuda"
+    batch_size = config["model"]["batch_size"]
+    steps_per_epoch = -(-n_train // batch_size)    # ceiling division
 
     return TrainingArguments(
         output_dir                  = SAVE_PATH,
         num_train_epochs            = config["model"]["num_epochs"],
         per_device_train_batch_size = batch_size,
         per_device_eval_batch_size  = batch_size * 2,
-        gradient_accumulation_steps = grad_accum,
         learning_rate               = float(config["model"]["learning_rate"]),
-        warmup_steps                = warmup_steps,
+        warmup_steps                = steps_per_epoch,
         weight_decay                = 0.01,
         eval_strategy               = "epoch",
         save_strategy               = "epoch",
         load_best_model_at_end      = True,
-        metric_for_best_model       = "f1",
-        greater_is_better           = True,
+        metric_for_best_model       = "eval_loss",
+        greater_is_better           = False,
         logging_steps               = 10,
         fp16                        = on_gpu,       # CPU does not support fp16
         dataloader_num_workers      = 0,            # Windows-safe
+        dataloader_pin_memory       = on_gpu,       # pinned memory only helps on GPU
         report_to                   = "none",
         save_total_limit            = 2,            # Keep only last 2 checkpoints
     )
@@ -330,7 +340,7 @@ def save_results(metrics: dict, train_df: pd.DataFrame):
 # MAIN
 # ─────────────────────────────────────────────
 
-def main():
+def main(binary_balanced: bool = True):
     logger.info("=" * 52)
     logger.info("  Phase 2 — Step 3: Train Classifier")
     logger.info("=" * 52)
@@ -351,7 +361,7 @@ def main():
 
     # ── 3. Class weights ──────────────────────────────
     logger.info("\nComputing class weights (fixing imbalance)...")
-    class_weights = compute_weights(train_df)
+    class_weights = compute_weights(train_df, binary_balanced)
 
     # ── 4. Load tokenizer & model ─────────────────────
     logger.info(f"\nLoading {MODEL_NAME}...")
@@ -397,7 +407,7 @@ def main():
         compute_metrics = compute_metrics,
         data_collator = data_collator,
         callbacks     = [
-            EarlyStoppingCallback(early_stopping_patience=2)
+            EarlyStoppingCallback(early_stopping_patience=3)
         ]
     )
 
@@ -449,4 +459,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Fine-tune the jailbreak classifier")
+    parser.add_argument(
+        "--class-weights", choices=["binary", "balanced"], default="binary",
+        help="binary: benign weighs as much as all attacks together (default); "
+             "balanced: plain per-class inverse frequency",
+    )
+    args = parser.parse_args()
+    main(binary_balanced=(args.class_weights == "binary"))
