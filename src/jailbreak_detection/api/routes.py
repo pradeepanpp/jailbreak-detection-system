@@ -1,26 +1,20 @@
 # src/jailbreak_detection/api/routes.py
 """
-FastAPI route handlers.
-
-All routes use the shared RiskEngine instance
-injected via FastAPI dependency injection.
-
 Endpoints:
-    POST /analyze           — single text detection
-    POST /analyze/batch     — batch detection (up to 20)
-    GET  /health            — layer status check
-    GET  /stats             — runtime counters
-    GET  /                  — welcome / docs redirect
+    POST /analyze         one text
+    POST /analyze/batch   up to 20 texts
+    GET  /health          layer status (503 if a layer is missing)
+    GET  /stats           counters since startup
 
-Why the handlers are plain `def`, not `async def`:
-model inference (PyTorch, sentence-transformers) is blocking CPU work.
-Inside `async def` it would block the event loop, so one long request
-would freeze every other request. FastAPI runs plain `def` handlers in
-a thread pool.
+Handlers are plain `def`, not `async def`: model inference is blocking
+CPU work, and FastAPI runs plain functions in a thread pool so one slow
+request does not hold up the others.
 """
 
 import threading
 import time
+from dataclasses import asdict
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from src.jailbreak_detection.api.schemas import (
@@ -28,92 +22,47 @@ from src.jailbreak_detection.api.schemas import (
     AnalyzeResponse,
     BatchAnalyzeRequest,
     BatchAnalyzeResponse,
-    LayerBreakdownResponse,
     HealthResponse,
+    LayerBreakdownResponse,
     StatsResponse,
 )
-from src.jailbreak_detection.aggregator.risk_engine import RiskResult
-from src.jailbreak_detection.constants import (
-    DECISION_BLOCK,
-    DECISION_MONITOR,
-    DECISION_ALLOW,
-)
+from src.jailbreak_detection.constants import DECISION_ALLOW, DECISION_BLOCK, DECISION_MONITOR
 from src.jailbreak_detection.utils import logger
 
-
 router = APIRouter()
-
 _stats_lock = threading.Lock()
 
 
-# ─────────────────────────────────────────────
-# DEPENDENCY — get shared engine from app state
-# ─────────────────────────────────────────────
-
 def get_engine(request: Request):
-    """Dependency injection: pull RiskEngine from app state."""
     engine = request.app.state.engine
     if engine is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Detection engine not initialized"
-        )
+        raise HTTPException(status_code=503, detail="Detection engine not initialized")
     return engine
 
 
 def get_stats(request: Request) -> dict:
-    """Dependency injection: pull stats counter from app state."""
     return request.app.state.stats
 
 
-# ─────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────
-
-def risk_result_to_response(
-    result: RiskResult,
-    include_breakdown: bool = True
-) -> AnalyzeResponse:
-    """Convert RiskResult dataclass → AnalyzeResponse Pydantic model."""
-
-    layers_resp = None
-    if include_breakdown:
-        bd = result.layers
-        layers_resp = LayerBreakdownResponse(
-            rule_score      = bd.rule_score,
-            rule_decision   = bd.rule_decision,
-            rule_severity   = bd.rule_severity,
-            rule_categories = bd.rule_categories,
-            rule_matches    = bd.rule_matches,
-            ml_score        = bd.ml_score,
-            ml_decision     = bd.ml_decision,
-            ml_category     = bd.ml_category,
-            ml_confidence   = bd.ml_confidence,
-            embedding_score    = bd.embedding_score,
-            embedding_decision = bd.embedding_decision,
-            embedding_category = bd.embedding_category,
-            embedding_sim      = bd.embedding_sim,
-            embedding_available= bd.embedding_available,
-        )
-
+def to_response(result, include_breakdown: bool = True) -> AnalyzeResponse:
+    layers = LayerBreakdownResponse(**asdict(result.layers)) if include_breakdown else None
     return AnalyzeResponse(
-        decision        = result.decision,
-        risk_score      = result.risk_score,
-        attack_category = result.attack_category,
-        severity        = result.severity,
-        is_attack       = result.is_attack,
-        explanation     = result.explanation,
-        original_text   = result.original_text,
-        processed_text  = result.processed_text,
-        override_applied= result.override_applied,
-        fast_path       = result.fast_path,
-        layers          = layers_resp,
+        decision=result.decision,
+        risk_score=result.risk_score,
+        attack_category=result.attack_category,
+        severity=result.severity,
+        is_attack=result.is_attack,
+        explanation=result.explanation,
+        original_text=result.original_text,
+        processed_text=result.processed_text,
+        override_applied=result.override_applied,
+        fast_path=result.fast_path,
+        layers=layers,
     )
 
 
-def update_stats(stats: dict, decision: str):
-    """Increment runtime counters (thread-safe: handlers run in a pool)."""
-    with _stats_lock:
+def count(stats: dict, decision: str):
+    with _stats_lock:   # handlers run in parallel threads
         stats["total_analyzed"] += 1
         if decision == DECISION_BLOCK:
             stats["total_blocked"] += 1
@@ -123,188 +72,86 @@ def update_stats(stats: dict, decision: str):
             stats["total_allowed"] += 1
 
 
-# ─────────────────────────────────────────────
-# ROUTES
-# ─────────────────────────────────────────────
-
 @router.get("/", tags=["info"])
 def root():
-    """Welcome message and links to API docs."""
     return {
-        "name":        "Jailbreak Detection API",
-        "version":     "1.0.0",
-        "description": "Multi-layer LLM jailbreak and adversarial prompt detection",
-        "docs":        "/docs",
-        "redoc":       "/redoc",
-        "health":      "/health",
+        "name": "Jailbreak Detection API",
+        "version": "1.0.0",
+        "docs": "/docs",
+        "health": "/health",
     }
 
 
-@router.post(
-    "/analyze",
-    response_model=AnalyzeResponse,
-    tags=["detection"],
-    summary="Analyze a single text for jailbreak/attack patterns",
-    responses={
-        200: {"description": "Analysis complete"},
-        422: {"description": "Validation error — text too long or blank"},
-        503: {"description": "Engine not initialized"},
-    }
-)
-def analyze(
-    body:   AnalyzeRequest,
-    engine = Depends(get_engine),
-    stats  = Depends(get_stats),
-):
-    """
-    Analyze a single text input through the full detection pipeline.
-
-    - **Rule engine** checks for known attack patterns (fast, deterministic)
-    - **ML classifier** predicts attack category using fine-tuned DistilBERT
-    - **Embedding matcher** detects semantically similar novel attacks
-
-    Returns a unified risk score, decision (BLOCK/MONITOR/ALLOW),
-    attack category, severity (1–5), and per-layer breakdown.
-    """
+@router.post("/analyze", response_model=AnalyzeResponse, tags=["detection"])
+def analyze(body: AnalyzeRequest, engine=Depends(get_engine), stats=Depends(get_stats)):
+    """Score one text: decision (BLOCK / MONITOR / ALLOW), risk score, category and per-layer details."""
     try:
-        result   = engine.analyze(body.text)
-        response = risk_result_to_response(result, body.include_breakdown)
-        update_stats(stats, result.decision)
-
-        logger.info(
-            f"[/analyze] decision={result.decision} "
-            f"score={result.risk_score:.3f} "
-            f"category={result.attack_category}"
-        )
-
-        return response
-
+        result = engine.analyze(body.text)
     except Exception as e:
-        logger.exception(f"[/analyze] Error: {e}")
+        logger.exception(f"/analyze failed: {e}")
         raise HTTPException(status_code=500, detail="Analysis failed")
 
+    count(stats, result.decision)
+    logger.info(f"/analyze {result.decision} risk={result.risk_score:.3f} {result.attack_category}")
+    return to_response(result, body.include_breakdown)
 
-@router.post(
-    "/analyze/batch",
-    response_model=BatchAnalyzeResponse,
-    tags=["detection"],
-    summary="Analyze multiple texts in a single request (max 20)",
-    responses={
-        200: {"description": "Batch analysis complete"},
-        422: {"description": "Validation error"},
-        503: {"description": "Engine not initialized"},
-    }
-)
-def analyze_batch(
-    body:   BatchAnalyzeRequest,
-    engine = Depends(get_engine),
-    stats  = Depends(get_stats),
-):
-    """
-    Analyze up to 20 texts (50,000 characters in total) in one call.
 
-    Returns individual results for each text plus a summary
-    with aggregate counts (total attacks, benign, BLOCK/MONITOR/ALLOW).
-    """
+@router.post("/analyze/batch", response_model=BatchAnalyzeResponse, tags=["detection"])
+def analyze_batch(body: BatchAnalyzeRequest, engine=Depends(get_engine), stats=Depends(get_stats)):
+    """Score up to 20 texts (50,000 characters in total)."""
     try:
-        risk_results = engine.analyze_batch(body.texts)
-
-        responses = [
-            risk_result_to_response(r, body.include_breakdown)
-            for r in risk_results
-        ]
-
-        # Build summary
-        decision_counts = {
-            DECISION_BLOCK:   0,
-            DECISION_MONITOR: 0,
-            DECISION_ALLOW:   0,
-        }
-        for r in risk_results:
-            decision_counts[r.decision] = decision_counts.get(r.decision, 0) + 1
-            update_stats(stats, r.decision)
-
-        attacks_found = sum(1 for r in risk_results if r.is_attack)
-
-        logger.info(
-            f"[/analyze/batch] {len(body.texts)} texts — "
-            f"attacks={attacks_found} "
-            f"blocked={decision_counts[DECISION_BLOCK]}"
-        )
-
-        return BatchAnalyzeResponse(
-            results       = responses,
-            total         = len(responses),
-            attacks_found = attacks_found,
-            benign_count  = len(responses) - attacks_found,
-            summary       = decision_counts,
-        )
-
+        results = engine.analyze_batch(body.texts)
     except Exception as e:
-        logger.exception(f"[/analyze/batch] Error: {e}")
+        logger.exception(f"/analyze/batch failed: {e}")
         raise HTTPException(status_code=500, detail="Batch analysis failed")
 
+    decisions = {DECISION_BLOCK: 0, DECISION_MONITOR: 0, DECISION_ALLOW: 0}
+    for r in results:
+        decisions[r.decision] += 1
+        count(stats, r.decision)
+    attacks = sum(1 for r in results if r.is_attack)
 
-@router.get(
-    "/health",
-    response_model=HealthResponse,
-    tags=["system"],
-    summary="Check system health and layer availability",
-    responses={503: {"description": "Degraded: a detection layer is not loaded"}},
-)
-def health(response: Response, engine = Depends(get_engine)):
-    """
-    Returns the current status of all detection layers.
-
-    - **200 ok**: all 3 layers active
-    - **503 degraded**: the engine runs, but the classifier or the
-      embedding index is missing (e.g. models were not mounted). Returning
-      503 makes Docker and load balancers notice instead of silently
-      serving rule-only results.
-    """
-    status_info = engine.status()
-    layers      = status_info["layers_active"]
-
-    if layers == 3:
-        status = "ok"
-    else:
-        status = "degraded"
-        response.status_code = 503
-
-    return HealthResponse(
-        status        = status,
-        layers_active = layers,
-        rule_engine   = status_info["rule_engine"],
-        ml_classifier = status_info["ml_classifier"],
-        embedding     = status_info["embedding"],
-        model_info    = {
-            "classifier": "distilbert-base-uncased (fine-tuned)",
-            "embedder":   "all-mpnet-base-v2",
-            "index_size": engine.embedding.index_size() if engine.embedding_ok else 0,
-        }
+    return BatchAnalyzeResponse(
+        results=[to_response(r, body.include_breakdown) for r in results],
+        total=len(results),
+        attacks_found=attacks,
+        benign_count=len(results) - attacks,
+        summary=decisions,
     )
 
 
-@router.get(
-    "/stats",
-    response_model=StatsResponse,
-    tags=["system"],
-    summary="Runtime statistics — requests analyzed since startup",
-)
-def stats(
-    request: Request,
-    stats   = Depends(get_stats),
-):
-    """Returns cumulative request counts and block rate since server start."""
-    total    = stats["total_analyzed"]
-    blocked  = stats["total_blocked"]
-    uptime   = time.time() - request.app.state.start_time
+@router.get("/health", response_model=HealthResponse, tags=["system"],
+            responses={503: {"description": "A detection layer is not loaded"}})
+def health(response: Response, engine=Depends(get_engine)):
+    """200 when all 3 layers are loaded, 503 otherwise, so Docker notices missing models."""
+    status = engine.status()
+    if status["layers_active"] < 3:
+        response.status_code = 503
 
+    return HealthResponse(
+        status="ok" if status["layers_active"] == 3 else "degraded",
+        layers_active=status["layers_active"],
+        rule_engine=status["rule_engine"],
+        ml_classifier=status["ml_classifier"],
+        embedding=status["embedding"],
+        model_info={
+            "classifier": "distilbert-base-uncased (fine-tuned)",
+            "embedder": "all-mpnet-base-v2",
+            "index_size": engine.embedding.index_size() if engine.embedding_ok else 0,
+        },
+    )
+
+
+@router.get("/stats", response_model=StatsResponse, tags=["system"])
+def stats(request: Request, counters=Depends(get_stats)):
+    """Request counts and block rate since the server started."""
+    total = counters["total_analyzed"]
+    blocked = counters["total_blocked"]
     return StatsResponse(
-        total_analyzed  = total,
-        total_blocked   = blocked,
-        total_monitored = stats["total_monitored"],
-        total_allowed   = stats["total_allowed"],
-        block_rate      = round(blocked / total, 4) if total > 0 else 0.0,
-        uptime_seconds  = round(uptime, 1),
+        total_analyzed=total,
+        total_blocked=blocked,
+        total_monitored=counters["total_monitored"],
+        total_allowed=counters["total_allowed"],
+        block_rate=round(blocked / total, 4) if total else 0.0,
+        uptime_seconds=round(time.time() - request.app.state.start_time, 1),
     )

@@ -1,642 +1,352 @@
 # src/jailbreak_detection/aggregator/risk_engine.py
 """
-Phase 3 — Risk Aggregation Engine.
+Combine the three detection layers into one risk score and decision.
 
-Combines outputs from all three detection layers into a
-single unified risk score and final decision.
+    rules       -> rule_score      (always on)
+    classifier  -> ml_score        (needs models/jailbreak_classifier/best)
+    embeddings  -> embedding_score (needs models/faiss_index)
 
-Architecture:
-    text input
-        │
-        ├── Layer 1: RuleEngine        → rule_score  (0.0–1.0)
-        ├── Layer 2: JailbreakClassifier → ml_score  (0.0–1.0)
-        └── Layer 3: EmbeddingMatcher  → embedding_score (0.0–1.0)
-                                               │
-                                        RiskEngine
-                                               │
-                                    ┌──────────┴──────────┐
-                                 risk_score (0.0–1.0)  decision
-                                 category              explanation
-                                 severity              layer_breakdown
+risk = weighted sum of the layer scores (weights and thresholds come from
+configs/detection_config.yaml). BLOCK at >= 0.65, MONITOR at >= 0.35.
 
-Scoring weights and thresholds come from configs/detection_config.yaml
-(defaults: rule 0.40, ML 0.35, embedding 0.25; BLOCK >= 0.65, MONITOR >= 0.35).
+Overrides:
+  1. a severity-5 rule blocks at once (the ML layers are skipped)
+  2. a severity-4 rule plus ml_score > 0.7 blocks
+  3. any single layer >= 0.95 raises the risk to at least 0.90
 
-Hard override rules (applied BEFORE weighted scoring):
-    1. Rule severity 5 (CRITICAL) → always BLOCK, skip ML
-    2. Rule severity 4 + ml_score > 0.7 → BLOCK
-    3. Any single layer score >= 0.95 → risk raised to at least 0.90
-
-Decoded input: the normalizer returns the original text plus any decoded
-variants (base64, ROT13, leetspeak, ...). Each layer scores every variant
-and keeps the highest risk, so a wrong decode can never hide the original.
+The input is scored in every form the normalizer produced (original
+first, then decoded versions) and the highest risk wins, so a wrong
+decode can never hide the original text.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional
 
-from src.jailbreak_detection.detection.rule_engine import (
-    RuleEngine,
-    RuleEngineResult,
-    RuleMatch,
-)
-from src.jailbreak_detection.detection.embedding_matcher import (
-    EmbeddingMatcher,
-    EmbeddingResult,
-)
-
-if TYPE_CHECKING:   # torch is only imported when the classifier is loaded
-    from src.jailbreak_detection.detection.ml_classifier import ClassifierResult
-from src.jailbreak_detection.preprocessing.normalizer import TextNormalizer
 from src.jailbreak_detection.constants import (
+    DECISION_ALLOW,
     DECISION_BLOCK,
     DECISION_MONITOR,
-    DECISION_ALLOW,
     SEVERITY_CRITICAL,
     SEVERITY_HIGH,
-    SEVERITY_MEDIUM,
     SEVERITY_LOW,
+    SEVERITY_MEDIUM,
     SEVERITY_MINIMAL,
 )
-from src.jailbreak_detection.utils import logger, load_config
+from src.jailbreak_detection.detection.embedding_matcher import EmbeddingMatcher
+from src.jailbreak_detection.detection.rule_engine import RuleEngine, RuleMatch
+from src.jailbreak_detection.preprocessing.normalizer import TextNormalizer
+from src.jailbreak_detection.utils import load_config, logger
 
-
-# ─────────────────────────────────────────────
-# CONSTANTS
-# ─────────────────────────────────────────────
 
 def _config_section(name: str) -> dict:
     try:
         return load_config().get(name) or {}
-    except Exception as e:   # missing/broken config → documented defaults
+    except Exception as e:
         logger.warning(f"Config not loaded ({e}); using default weights")
         return {}
 
 
-_W = _config_section("weights")
-_T = _config_section("thresholds")
+_weights = _config_section("weights")
+_thresholds = _config_section("thresholds")
 
-# Weighted contribution of each layer to final risk score
-WEIGHT_RULE      = float(_W.get("rule_engine",       0.40))
-WEIGHT_ML        = float(_W.get("ml_classifier",     0.35))
-WEIGHT_EMBEDDING = float(_W.get("embedding_matcher", 0.25))
+WEIGHT_RULE = float(_weights.get("rule_engine", 0.40))
+WEIGHT_ML = float(_weights.get("ml_classifier", 0.35))
+WEIGHT_EMBEDDING = float(_weights.get("embedding_matcher", 0.25))
+RISK_BLOCK_THRESHOLD = float(_thresholds.get("block", 0.65))
+RISK_MONITOR_THRESHOLD = float(_thresholds.get("monitor", 0.35))
 
-# Final risk score thresholds
-RISK_BLOCK_THRESHOLD   = float(_T.get("block",   0.65))
-RISK_MONITOR_THRESHOLD = float(_T.get("monitor", 0.35))
+MAX_VARIANTS = 3   # original text + up to 2 decoded versions
 
-# Max text views scored per request (original + decoded variants)
-MAX_VARIANTS = 3
-
-
-# ─────────────────────────────────────────────
-# DATA CLASSES
-# ─────────────────────────────────────────────
 
 @dataclass
 class LayerBreakdown:
-    """Scores and decisions from each individual layer."""
-    # Rule engine
-    rule_score:      float = 0.0
-    rule_decision:   str   = DECISION_ALLOW
-    rule_severity:   int   = 0
-    rule_categories: list  = field(default_factory=list)
-    rule_matches:    int   = 0
+    rule_score: float = 0.0
+    rule_decision: str = DECISION_ALLOW
+    rule_severity: int = 0
+    rule_categories: list = field(default_factory=list)
+    rule_matches: int = 0
 
-    # ML classifier
-    ml_score:         float = 0.0
-    ml_decision:      str   = DECISION_ALLOW
-    ml_category:      str   = "benign"
-    ml_confidence:    float = 0.0
+    ml_score: float = 0.0
+    ml_decision: str = DECISION_ALLOW
+    ml_category: str = "benign"
+    ml_confidence: float = 0.0
 
-    # Embedding matcher
-    embedding_score:    float = 0.0
-    embedding_decision: str   = DECISION_ALLOW
-    embedding_category: str   = "benign"
-    embedding_sim:      float = 0.0
-    embedding_available: bool  = False
+    embedding_score: float = 0.0
+    embedding_decision: str = DECISION_ALLOW
+    embedding_category: str = "benign"
+    embedding_sim: float = 0.0
+    embedding_available: bool = False
 
 
 @dataclass
 class RiskResult:
-    """
-    Final unified result from the Risk Engine.
-    This is what the API and dashboard consume.
-    """
-    # Input
-    original_text:   str
-    processed_text:  str
+    original_text: str
+    processed_text: str
+    risk_score: float          # 0.0 - 1.0
+    decision: str              # BLOCK / MONITOR / ALLOW
+    attack_category: str
+    severity: int              # 1 - 5
+    explanation: str
+    is_attack: bool
+    layers: LayerBreakdown = field(default_factory=LayerBreakdown)
+    override_applied: str = ""
+    fast_path: bool = False    # True when an override returned early
 
-    # Final verdict
-    risk_score:      float          # 0.0 – 1.0
-    decision:        str            # BLOCK / MONITOR / ALLOW
-    attack_category: str            # predicted attack type
-    severity:        int            # 1–5
-    explanation:     str            # human-readable reason
-    is_attack:       bool
-
-    # Layer breakdown (for dashboard/debugging)
-    layers:          LayerBreakdown = field(default_factory=LayerBreakdown)
-
-    # Metadata
-    override_applied:  str  = ""    # which hard override fired, if any
-    fast_path:         bool = False # True if early exit was taken
-
-
-# ─────────────────────────────────────────────
-# RISK ENGINE
-# ─────────────────────────────────────────────
 
 class RiskEngine:
     """
-    Unified detection pipeline combining all three layers.
-
-    Usage:
-        engine = RiskEngine()
-        result = engine.analyze("ignore all previous instructions")
-
-        print(result.decision)        # BLOCK
-        print(result.risk_score)      # 0.91
-        print(result.attack_category) # direct_jailbreak
-        print(result.explanation)     # "Rule engine: critical severity..."
+    engine = RiskEngine()
+    result = engine.analyze("ignore all previous instructions")
+    result.decision, result.risk_score, result.attack_category
     """
 
     MODEL_PATH = "models/jailbreak_classifier/best"
     INDEX_PATH = "models/faiss_index"
 
-    def __init__(
-        self,
-        load_classifier:  bool = True,
-        load_embedding:   bool = True,
-        classifier=None,
-        embedding=None,
-    ):
-        """
-        Initialize all detection layers.
-
-        Args:
-            load_classifier: Load ML classifier (set False for rule-only mode)
-            load_embedding:  Load embedding index (set False if index not built)
-            classifier:      Pre-built classifier (used by tests; skips loading)
-            embedding:       Pre-built embedding matcher (used by tests)
-        """
-        logger.info("Initializing RiskEngine...")
-
-        # Layer 0 — Preprocessing (always active)
+    def __init__(self, load_classifier: bool = True, load_embedding: bool = True,
+                 classifier=None, embedding=None):
+        """classifier / embedding: pass ready objects (used by tests) to skip loading."""
         self.normalizer = TextNormalizer()
-
-        # Layer 1 — Rule Engine (always active, zero dependencies)
         self.rule_engine = RuleEngine()
 
-        # Layer 2 — ML Classifier (requires trained model)
-        self.classifier     = classifier
-        self.classifier_ok  = classifier is not None
+        self.classifier = classifier
         if load_classifier and classifier is None:
-            try:
-                from src.jailbreak_detection.detection.ml_classifier import JailbreakClassifier
-                self.classifier    = JailbreakClassifier.load(self.MODEL_PATH)
-                self.classifier_ok = True
-                logger.info("ML classifier loaded ✓")
-            except Exception as e:
-                logger.warning(f"ML classifier unavailable: {e}")
-                logger.warning("Running without ML layer — rule + embedding only")
+            self.classifier = self._load_classifier()
+        self.classifier_ok = self.classifier is not None
 
-        # Layer 3 — Embedding Matcher (requires built index)
-        self.embedding      = embedding
-        self.embedding_ok   = embedding is not None
+        self.embedding = embedding
         if load_embedding and embedding is None:
-            try:
-                matcher = EmbeddingMatcher()
-                ok      = matcher.load(self.INDEX_PATH)
-                if ok:
-                    self.embedding    = matcher
-                    self.embedding_ok = True
-                    logger.info("Embedding index loaded ✓")
-                else:
-                    logger.warning("Embedding index not found — skipping embedding layer")
-            except Exception as e:
-                logger.warning(f"Embedding matcher unavailable: {e}")
+            self.embedding = self._load_embedding()
+        self.embedding_ok = self.embedding is not None
 
-        active = ["rule_engine"]
-        if self.classifier_ok:
-            active.append("ml_classifier")
-        if self.embedding_ok:
-            active.append("embedding_matcher")
+        logger.info(f"RiskEngine ready: rules, classifier={self.classifier_ok}, embeddings={self.embedding_ok}")
 
-        logger.info(f"RiskEngine ready — active layers: {active}")
+    def _load_classifier(self):
+        try:
+            # Imported here because it needs PyTorch
+            from src.jailbreak_detection.detection.ml_classifier import JailbreakClassifier
+            return JailbreakClassifier.load(self.MODEL_PATH)
+        except Exception as e:
+            logger.warning(f"Classifier not available, continuing without it: {e}")
+            return None
 
-    # ─────────────────────────────────────────
-    # MAIN ENTRY POINT
-    # ─────────────────────────────────────────
+    def _load_embedding(self):
+        try:
+            matcher = EmbeddingMatcher()
+            return matcher if matcher.load(self.INDEX_PATH) else None
+        except Exception as e:
+            logger.warning(f"Embedding index not available, continuing without it: {e}")
+            return None
 
     def analyze(self, text: str) -> RiskResult:
-        """
-        Run full detection pipeline on input text.
-
-        Args:
-            text: Raw input text from user
-
-        Returns:
-            RiskResult with decision, risk_score, explanation,
-            and per-layer breakdown
-        """
         if not text or not isinstance(text, str):
             return self._empty_result(text or "")
 
-        # ── 0. Preprocess (decode once, keep original) ──
         processed, variants, methods = self._preprocess(text)
 
-        # ── 1. Rule Engine — cheap, so score every variant ──
-        rule_result = max(
-            (self.rule_engine.check(v) for v in variants),
-            key=lambda r: (r.max_severity, r.rule_score),
-        )
+        # Rules are cheap, so check every variant and keep the worst
+        rule_r = None
+        for variant in variants:
+            r = self.rule_engine.check(variant)
+            if rule_r is None or (r.max_severity, r.rule_score) > (rule_r.max_severity, rule_r.rule_score):
+                rule_r = r
         if methods:
-            rule_result = self._add_obfuscation_signal(rule_result, methods, processed)
+            rule_r = self._add_obfuscation_signal(rule_r, methods, processed)
 
-        # Hard override 1 — Critical severity → immediate BLOCK
-        if rule_result.max_severity >= SEVERITY_CRITICAL:
-            return self._build_result(
-                original  = text,
-                processed = processed,
-                rule_r    = rule_result,
-                ml_r      = None,
-                emb_r     = None,
-                override  = "CRITICAL_RULE",
-                fast_path = True
-            )
+        if rule_r.max_severity >= SEVERITY_CRITICAL:
+            return self._build_result(text, processed, rule_r, None, None, "CRITICAL_RULE", True)
 
-        # ── 2. ML Classifier ──────────────────────────
-        ml_result = None
+        ml_r = None
         if self.classifier_ok:
             try:
-                ml_result = max(
-                    (self.classifier.predict(v) for v in variants),
-                    key=lambda r: r.ml_score,
-                )
+                ml_r = max((self.classifier.predict(v) for v in variants), key=lambda r: r.ml_score)
             except Exception as e:
-                logger.warning(f"ML classifier inference failed: {e}")
+                logger.warning(f"Classifier failed: {e}")
 
-        # Hard override 2 — High rule severity + high ML score
-        if (
-            rule_result.max_severity >= SEVERITY_HIGH
-            and ml_result
-            and ml_result.ml_score > 0.70
-        ):
-            return self._build_result(
-                original  = text,
-                processed = processed,
-                rule_r    = rule_result,
-                ml_r      = ml_result,
-                emb_r     = None,
-                override  = "HIGH_RULE_ML_CONFIRM",
-                fast_path = True
-            )
+        if rule_r.max_severity >= SEVERITY_HIGH and ml_r and ml_r.ml_score > 0.70:
+            return self._build_result(text, processed, rule_r, ml_r, None, "HIGH_RULE_ML_CONFIRM", True)
 
-        # ── 3. Embedding Matcher ───────────────────────
-        emb_result = None
+        emb_r = None
         if self.embedding_ok:
             try:
-                emb_result = max(
-                    (self.embedding.match(v) for v in variants),
-                    key=lambda r: r.embedding_score,
-                )
+                emb_r = max((self.embedding.match(v) for v in variants), key=lambda r: r.embedding_score)
             except Exception as e:
-                logger.warning(f"Embedding matcher inference failed: {e}")
+                logger.warning(f"Embedding matcher failed: {e}")
 
-        # ── 4. Aggregate and decide ───────────────────
-        return self._build_result(
-            original  = text,
-            processed = processed,
-            rule_r    = rule_result,
-            ml_r      = ml_result,
-            emb_r     = emb_result,
-            override  = "",
-            fast_path = False
+        return self._build_result(text, processed, rule_r, ml_r, emb_r, "", False)
+
+    def analyze_batch(self, texts: list) -> list:
+        return [self.analyze(t) for t in texts]
+
+    def _preprocess(self, text: str):
+        """Returns (text to show, texts to score, encodings found)."""
+        try:
+            result = self.normalizer.process(text)
+        except Exception as e:
+            logger.warning(f"Preprocessing failed, using raw text: {e}")
+            return text, [text], []
+        variants = result["detection_variants"] or [text]
+        return result["text_for_detection"] or text, variants[:MAX_VARIANTS], result["all_detected_methods"]
+
+    def _add_obfuscation_signal(self, rule_r, methods: list, decoded: str):
+        """
+        Hiding text behind an encoding is a medium-risk signal on its own,
+        even when the decoded text matches no rule ("h3lp m3 h4ck th1s").
+        """
+        signal = RuleMatch(
+            rule_id="EN005",
+            category="encoding_attack",
+            severity=SEVERITY_MEDIUM,
+            matched_text=", ".join(methods),
+            context=decoded[:100],
+            description=f"Obfuscated input decoded ({', '.join(methods)})",
         )
+        result = self.rule_engine.build_result(decoded, rule_r.matches + [signal])
+        others = [c for c in result.categories_hit if c != "encoding_attack"]
+        result.categories_hit = ["encoding_attack"] + others
+        return result
 
-    # ─────────────────────────────────────────
-    # SCORING & DECISION
-    # ─────────────────────────────────────────
-
-    def _build_result(
-        self,
-        original:  str,
-        processed: str,
-        rule_r:    Optional[RuleEngineResult],
-        ml_r:      Optional[ClassifierResult],
-        emb_r:     Optional[EmbeddingResult],
-        override:  str,
-        fast_path: bool
-    ) -> RiskResult:
-        """Compute weighted risk score and build final RiskResult."""
-
-        # Extract scores
-        rule_score = rule_r.rule_score      if rule_r  else 0.0
-        ml_score   = ml_r.ml_score          if ml_r    else 0.0
-        emb_score  = emb_r.embedding_score  if emb_r   else 0.0
-
-        # Adjust weights when layers are unavailable
+    def _combined_score(self, rule_score: float, ml_score: float, emb_score: float) -> float:
+        """Weighted sum; a missing layer's weight is split over the others."""
         if not self.classifier_ok and not self.embedding_ok:
-            # Rule only
-            risk_score = rule_score
-        elif not self.classifier_ok:
-            # Rule + embedding
-            w_rule = WEIGHT_RULE + WEIGHT_ML * 0.5
-            w_emb  = WEIGHT_EMBEDDING + WEIGHT_ML * 0.5
-            risk_score = rule_score * w_rule + emb_score * w_emb
-        elif not self.embedding_ok:
-            # Rule + ML
-            w_rule = WEIGHT_RULE + WEIGHT_EMBEDDING * 0.5
-            w_ml   = WEIGHT_ML   + WEIGHT_EMBEDDING * 0.5
-            risk_score = rule_score * w_rule + ml_score * w_ml
-        else:
-            # All three layers active
-            risk_score = (
-                rule_score * WEIGHT_RULE
-                + ml_score * WEIGHT_ML
-                + emb_score * WEIGHT_EMBEDDING
-            )
+            return rule_score
+        if not self.classifier_ok:
+            return (rule_score * (WEIGHT_RULE + WEIGHT_ML / 2)
+                    + emb_score * (WEIGHT_EMBEDDING + WEIGHT_ML / 2))
+        if not self.embedding_ok:
+            return (rule_score * (WEIGHT_RULE + WEIGHT_EMBEDDING / 2)
+                    + ml_score * (WEIGHT_ML + WEIGHT_EMBEDDING / 2))
+        return rule_score * WEIGHT_RULE + ml_score * WEIGHT_ML + emb_score * WEIGHT_EMBEDDING
 
-        risk_score = float(min(1.0, max(0.0, risk_score)))
+    def _build_result(self, original, processed, rule_r, ml_r, emb_r, override, fast_path) -> RiskResult:
+        rule_score = rule_r.rule_score if rule_r else 0.0
+        ml_score = ml_r.ml_score if ml_r else 0.0
+        emb_score = emb_r.embedding_score if emb_r else 0.0
 
-        # Hard override 3 — any single layer extremely confident
-        if rule_score >= 0.95 or ml_score >= 0.95 or emb_score >= 0.95:
-            risk_score = max(risk_score, 0.90)
-            if not override:
-                override = "SINGLE_LAYER_HIGH_CONFIDENCE"
+        risk = min(1.0, max(0.0, self._combined_score(rule_score, ml_score, emb_score)))
 
-        # Fast path override scores are always high
-        if fast_path and override == "CRITICAL_RULE":
-            risk_score = max(risk_score, 0.95)
-        elif fast_path and override == "HIGH_RULE_ML_CONFIRM":
-            risk_score = max(risk_score, 0.80)
+        # One very confident layer is enough to raise the risk
+        if max(rule_score, ml_score, emb_score) >= 0.95:
+            risk = max(risk, 0.90)
+            override = override or "SINGLE_LAYER_HIGH_CONFIDENCE"
+        if override == "CRITICAL_RULE":
+            risk = max(risk, 0.95)
+        elif override == "HIGH_RULE_ML_CONFIRM":
+            risk = max(risk, 0.80)
 
-        # Final decision from risk score
-        if risk_score >= RISK_BLOCK_THRESHOLD:
+        if risk >= RISK_BLOCK_THRESHOLD:
             decision = DECISION_BLOCK
-        elif risk_score >= RISK_MONITOR_THRESHOLD:
+        elif risk >= RISK_MONITOR_THRESHOLD:
             decision = DECISION_MONITOR
         else:
             decision = DECISION_ALLOW
 
-        # Attack category — use most confident layer's output
-        attack_category = self._resolve_category(rule_r, ml_r, emb_r, decision)
-
-        # Severity from risk score
-        severity = self._score_to_severity(risk_score)
-
-        # Human-readable explanation
-        explanation = self._build_explanation(
-            rule_r, ml_r, emb_r, decision, risk_score, override
-        )
-
-        # Layer breakdown for dashboard
-        layers = self._build_breakdown(rule_r, ml_r, emb_r)
-
-        is_attack = (decision != DECISION_ALLOW)
-
-        logger.debug(
-            f"RiskEngine: score={risk_score:.3f} "
-            f"decision={decision} "
-            f"category={attack_category} "
-            f"override={override or 'none'}"
-        )
-
         return RiskResult(
-            original_text   = original,
-            processed_text  = processed,
-            risk_score      = round(risk_score, 4),
-            decision        = decision,
-            attack_category = attack_category,
-            severity        = severity,
-            explanation     = explanation,
-            is_attack       = is_attack,
-            layers          = layers,
-            override_applied= override,
-            fast_path       = fast_path,
+            original_text=original,
+            processed_text=processed,
+            risk_score=round(risk, 4),
+            decision=decision,
+            attack_category=self._category(rule_r, ml_r, emb_r, decision),
+            severity=self._severity(risk),
+            explanation=self._explain(rule_r, ml_r, emb_r, decision, risk, override),
+            is_attack=decision != DECISION_ALLOW,
+            layers=self._breakdown(rule_r, ml_r, emb_r),
+            override_applied=override,
+            fast_path=fast_path,
         )
 
-    def _resolve_category(
-        self,
-        rule_r: Optional[RuleEngineResult],
-        ml_r:   Optional[ClassifierResult],
-        emb_r:  Optional[EmbeddingResult],
-        decision: str
-    ) -> str:
-        """
-        Pick the most meaningful attack category from all layers.
-
-        Priority:
-          1. Rule engine categories (deterministic)
-          2. ML classifier category (if confident)
-          3. Embedding top category
-          4. "benign" if decision is ALLOW
-        """
+    @staticmethod
+    def _category(rule_r, ml_r, emb_r, decision: str) -> str:
+        """Rules first (most severe match), then the classifier, then embeddings."""
         if decision == DECISION_ALLOW:
             return "benign"
-
-        # Rule engine categories — most reliable
         if rule_r and rule_r.categories_hit:
             return rule_r.categories_hit[0]
-
-        # ML classifier — if it detected an attack
         if ml_r and ml_r.is_attack:
             return ml_r.predicted_category
-
-        # Embedding — fallback
         if emb_r and emb_r.is_attack:
             return emb_r.top_category
+        return "direct_jailbreak"
 
-        return "direct_jailbreak"  # safe fallback
-
-    def _score_to_severity(self, risk_score: float) -> int:
-        """Map 0.0–1.0 risk score to 1–5 severity tier."""
-        if risk_score >= 0.85:
+    @staticmethod
+    def _severity(risk: float) -> int:
+        if risk >= 0.85:
             return SEVERITY_CRITICAL
-        elif risk_score >= 0.65:
+        if risk >= 0.65:
             return SEVERITY_HIGH
-        elif risk_score >= 0.40:
+        if risk >= 0.40:
             return SEVERITY_MEDIUM
-        elif risk_score >= 0.20:
+        if risk >= 0.20:
             return SEVERITY_LOW
-        else:
-            return SEVERITY_MINIMAL
+        return SEVERITY_MINIMAL
 
-    def _build_explanation(
-        self,
-        rule_r:    Optional[RuleEngineResult],
-        ml_r:      Optional[ClassifierResult],
-        emb_r:     Optional[EmbeddingResult],
-        decision:  str,
-        score:     float,
-        override:  str
-    ) -> str:
-        """Build a concise human-readable explanation."""
-        parts = []
-
+    @staticmethod
+    def _explain(rule_r, ml_r, emb_r, decision: str, risk: float, override: str) -> str:
         if override == "CRITICAL_RULE":
-            rule_cats = ", ".join(rule_r.categories_hit) if rule_r else "unknown"
-            return (
-                f"CRITICAL rule match: {rule_cats}. "
-                f"Severity 5 — immediate block."
-            )
-
+            categories = ", ".join(rule_r.categories_hit) if rule_r else "unknown"
+            return f"CRITICAL rule match: {categories}. Severity 5 — immediate block."
         if override == "HIGH_RULE_ML_CONFIRM":
-            return (
-                f"High-severity rule match confirmed by ML classifier "
-                f"(ml_score={ml_r.ml_score:.2f}). Blocked."
-            )
+            return f"High-severity rule match confirmed by ML classifier (ml_score={ml_r.ml_score:.2f}). Blocked."
 
+        parts = []
         if rule_r and rule_r.matches:
-            parts.append(
-                f"Rule engine: {len(rule_r.matches)} match(es), "
-                f"severity={rule_r.max_severity}"
-            )
-
+            parts.append(f"Rule engine: {len(rule_r.matches)} match(es), severity={rule_r.max_severity}")
         if ml_r and ml_r.is_attack:
-            parts.append(
-                f"ML: {ml_r.predicted_category} "
-                f"(score={ml_r.ml_score:.2f})"
-            )
-
+            parts.append(f"ML: {ml_r.predicted_category} (score={ml_r.ml_score:.2f})")
         if emb_r and emb_r.is_attack:
-            parts.append(
-                f"Embedding: similar to {emb_r.top_category} "
-                f"(sim={emb_r.top_similarity:.2f})"
-            )
+            parts.append(f"Embedding: similar to {emb_r.top_category} (sim={emb_r.top_similarity:.2f})")
 
-        if not parts:
-            if decision == DECISION_ALLOW:
-                return "No attack signals detected across all layers."
-            else:
-                return f"Aggregated risk score {score:.2f} exceeds threshold."
+        if parts:
+            return " | ".join(parts) + f" | risk={risk:.2f}"
+        if decision == DECISION_ALLOW:
+            return "No attack signals detected across all layers."
+        return f"Aggregated risk score {risk:.2f} exceeds threshold."
 
-        return " | ".join(parts) + f" | risk={score:.2f}"
-
-    def _build_breakdown(
-        self,
-        rule_r: Optional[RuleEngineResult],
-        ml_r:   Optional[ClassifierResult],
-        emb_r:  Optional[EmbeddingResult]
-    ) -> LayerBreakdown:
-        """Build LayerBreakdown dataclass from layer results."""
-        bd = LayerBreakdown()
-
+    @staticmethod
+    def _breakdown(rule_r, ml_r, emb_r) -> LayerBreakdown:
+        b = LayerBreakdown()
         if rule_r:
-            bd.rule_score      = rule_r.rule_score
-            bd.rule_decision   = rule_r.decision
-            bd.rule_severity   = rule_r.max_severity
-            bd.rule_categories = rule_r.categories_hit
-            bd.rule_matches    = len(rule_r.matches)
-
+            b.rule_score = rule_r.rule_score
+            b.rule_decision = rule_r.decision
+            b.rule_severity = rule_r.max_severity
+            b.rule_categories = rule_r.categories_hit
+            b.rule_matches = len(rule_r.matches)
         if ml_r:
-            bd.ml_score      = ml_r.ml_score
-            bd.ml_decision   = DECISION_BLOCK if ml_r.is_attack else DECISION_ALLOW
-            bd.ml_category   = ml_r.predicted_category
-            bd.ml_confidence = ml_r.confidence
-
+            b.ml_score = ml_r.ml_score
+            b.ml_decision = DECISION_BLOCK if ml_r.is_attack else DECISION_ALLOW
+            b.ml_category = ml_r.predicted_category
+            b.ml_confidence = ml_r.confidence
         if emb_r:
-            bd.embedding_score     = emb_r.embedding_score
-            bd.embedding_decision  = emb_r.decision
-            bd.embedding_category  = emb_r.top_category
-            bd.embedding_sim       = emb_r.top_similarity
-            bd.embedding_available = emb_r.index_available
+            b.embedding_score = emb_r.embedding_score
+            b.embedding_decision = emb_r.decision
+            b.embedding_category = emb_r.top_category
+            b.embedding_sim = emb_r.top_similarity
+            b.embedding_available = emb_r.index_available
+        return b
 
-        return bd
-
-    # ─────────────────────────────────────────
-    # PREPROCESSING
-    # ─────────────────────────────────────────
-
-    def _preprocess(self, text: str) -> tuple[str, list, list]:
-        """
-        Run the normalizer once (it runs the decoders internally).
-
-        Returns:
-            processed: text shown to users (decoded text if encoding found)
-            variants:  texts the detectors score — original first, then
-                       decoded variants, capped at MAX_VARIANTS
-            methods:   encodings that were found (e.g. ["base64"])
-        """
-        try:
-            result    = self.normalizer.process(text)
-            variants  = result.get("detection_variants") or [text]
-            processed = result.get("text_for_detection") or text
-            methods   = result.get("all_detected_methods") or []
-            return processed, variants[:MAX_VARIANTS], methods
-        except Exception as e:
-            logger.warning(f"Preprocessing failed, using raw text: {e}")
-            return text, [text], []
-
-    def _add_obfuscation_signal(
-        self, rule_r: RuleEngineResult, methods: list, decoded: str
-    ) -> RuleEngineResult:
-        """
-        Hiding text behind an encoding is itself a medium-risk signal, even
-        when the decoded text matches no rule ("h3lp m3 h4ck th1s"). The
-        category is reported as encoding_attack, since that is the technique.
-        """
-        signal = RuleMatch(
-            rule_id      = "EN005",
-            category     = "encoding_attack",
-            severity     = SEVERITY_MEDIUM,
-            matched_text = ", ".join(methods),
-            context      = decoded[:100],
-            description  = f"Obfuscated input decoded ({', '.join(methods)})",
-        )
-        result = self.rule_engine._build_result(decoded, rule_r.matches + [signal])
-        result.categories_hit = ["encoding_attack"] + [
-            c for c in result.categories_hit if c != "encoding_attack"
-        ]
-        return result
-
-    # ─────────────────────────────────────────
-    # UTILITIES
-    # ─────────────────────────────────────────
-
-    def _empty_result(self, text: str) -> RiskResult:
-        """Return a safe ALLOW result for empty/invalid input."""
+    @staticmethod
+    def _empty_result(text: str) -> RiskResult:
         return RiskResult(
-            original_text   = text,
-            processed_text  = text,
-            risk_score      = 0.0,
-            decision        = DECISION_ALLOW,
-            attack_category = "benign",
-            severity        = SEVERITY_MINIMAL,
-            explanation     = "Empty or invalid input.",
-            is_attack       = False,
+            original_text=text,
+            processed_text=text,
+            risk_score=0.0,
+            decision=DECISION_ALLOW,
+            attack_category="benign",
+            severity=SEVERITY_MINIMAL,
+            explanation="Empty or invalid input.",
+            is_attack=False,
         )
 
     def warm_up(self) -> None:
-        """
-        Run one throwaway request so lazy model loading (the sentence
-        embedding model loads on first use) and first-call overhead do not
-        land on a real user request or in latency measurements.
-        """
+        """One throwaway request, so model loading is not charged to a real user (or to latency numbers)."""
         try:
             self.analyze("Warm-up request: what is the capital of France?")
         except Exception as e:
             logger.warning(f"Warm-up failed: {e}")
 
     def status(self) -> dict:
-        """Return current layer availability status."""
         return {
-            "rule_engine":  True,
+            "rule_engine": True,
             "ml_classifier": self.classifier_ok,
-            "embedding":     self.embedding_ok,
-            "layers_active": sum([
-                True,
-                self.classifier_ok,
-                self.embedding_ok
-            ])
+            "embedding": self.embedding_ok,
+            "layers_active": 1 + self.classifier_ok + self.embedding_ok,
         }
-
-    def analyze_batch(self, texts: list) -> list:
-        """
-        Analyze a list of texts.
-        Returns list of RiskResult in same order as input.
-        """
-        return [self.analyze(t) for t in texts]

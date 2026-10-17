@@ -1,35 +1,17 @@
 # scripts/evaluate.py
 """
-Phase 6 — Evaluation & Benchmarking.
+Evaluate the full detection pipeline.
 
-Runs the complete detection pipeline against the held-out test set
-and produces a comprehensive evaluation report.
+    python scripts/evaluate.py
 
 Evaluation sets:
-  test.csv            in-distribution test split (group-aware, no near-dups)
+  test.csv            in-distribution test split (group-aware)
   hard_negatives.csv  benign prompts that look suspicious, never trained on
-                      → the realistic false-positive rate
   external_test.csv   WildGuard test set, never trained on (if available)
-                      → generalisation to prompts written by other people
 
-All rates come with 95% Wilson confidence intervals: with ~50 test
-samples, one error moves recall by ~3 points, so intervals matter.
-
-Metrics computed:
-  - Per-class precision, recall, F1
-  - Macro + weighted F1, accuracy
-  - Confusion matrix
-  - Layer ablation (rule-only, rule+ml, all-three)
-  - Latency benchmarks (p50, p95, p99)
-  - False positive rate on benign subset and on held-out hard negatives
-  - Risk score distribution per class
-
-Outputs:
-  data/results/evaluation_report.json   ← machine-readable full results
-  data/results/evaluation_summary.txt   ← human-readable summary
-
-Run:
-    python scripts/evaluate.py
+Reports binary and 7-class metrics, 95% Wilson confidence intervals,
+latency, and an ablation (rules / rules + classifier / full system).
+Writes data/results/evaluation_report.json and evaluation_summary.txt.
 """
 
 import sys
@@ -50,17 +32,12 @@ from sklearn.metrics import (
 from src.jailbreak_detection.aggregator.risk_engine import RiskEngine
 from src.jailbreak_detection.constants import (
     LABEL_NAMES,
-    LABEL_MAP,
     DECISION_BLOCK,
     DECISION_MONITOR,
     DECISION_ALLOW,
 )
 from src.jailbreak_detection.utils import logger, ensure_dirs
 
-
-# ─────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────
 
 TEST_CSV      = "data/processed/test.csv"
 HARD_NEG_CSV  = "data/processed/hard_negatives.csv"
@@ -69,16 +46,6 @@ RESULTS_DIR   = "data/results"
 REPORT_JSON   = f"{RESULTS_DIR}/evaluation_report.json"
 REPORT_TXT    = f"{RESULTS_DIR}/evaluation_summary.txt"
 
-# Attack categories (non-benign)
-ATTACK_LABELS = [name for name in LABEL_NAMES if name != "benign"]
-
-# Binary mapping: any non-benign → attack
-BENIGN_ID     = LABEL_MAP["benign"]
-
-
-# ─────────────────────────────────────────────
-# DATA LOADING
-# ─────────────────────────────────────────────
 
 def load_test_data() -> pd.DataFrame:
     if not os.path.exists(TEST_CSV):
@@ -86,23 +53,13 @@ def load_test_data() -> pd.DataFrame:
             f"Missing: {TEST_CSV}\n"
             "Run scripts/download_datasets.py first."
         )
-    df = pd.read_csv(TEST_CSV)
-    logger.info(f"Test set loaded: {len(df)} samples")
-    return df
+    return pd.read_csv(TEST_CSV)
 
-
-# ─────────────────────────────────────────────
-# INFERENCE
-# ─────────────────────────────────────────────
 
 def run_inference(engine: RiskEngine, texts: list) -> tuple:
     """
-    Run engine on all test texts.
-    Returns (results, latencies_ms).
-
-    One untimed warm-up request runs first: otherwise the embedding
-    model's lazy load (several seconds) lands in the first sample and
-    distorts mean/p99 latency.
+    Run the engine on every text; returns (results, latencies in ms).
+    One untimed warm-up request runs first so model loading is not timed.
     """
     engine.warm_up()
     results    = []
@@ -116,15 +73,9 @@ def run_inference(engine: RiskEngine, texts: list) -> tuple:
         latencies.append((t1 - t0) * 1000)   # ms
         results.append(result)
 
-        if (i + 1) % 10 == 0:
-            logger.info(f"  Processed {i+1}/{len(texts)} samples...")
 
     return results, latencies
 
-
-# ─────────────────────────────────────────────
-# METRICS
-# ─────────────────────────────────────────────
 
 def wilson_interval(k: int, n: int, z: float = 1.96) -> list:
     """95% Wilson score interval for k successes out of n."""
@@ -285,10 +236,6 @@ def compute_score_distribution(
     return dist
 
 
-# ─────────────────────────────────────────────
-# LAYER ABLATION
-# ─────────────────────────────────────────────
-
 def run_ablation(texts: list, y_true_labels: list) -> dict:
     """
     Compare binary F1 (test set) and hard-negative FPR across three
@@ -297,8 +244,6 @@ def run_ablation(texts: list, y_true_labels: list) -> dict:
       2. Rule + ML (no embedding)
       3. All three layers (full system)
     """
-    logger.info("Running layer ablation study...")
-
     configs = [
         ("rule_only",    RiskEngine(load_classifier=False, load_embedding=False)),
         ("rule_ml",      RiskEngine(load_classifier=True,  load_embedding=False)),
@@ -307,7 +252,6 @@ def run_ablation(texts: list, y_true_labels: list) -> dict:
 
     ablation = {}
     for name, engine in configs:
-        logger.info(f"  Ablation: {name}...")
         results, latencies = run_inference(engine, texts)
         binary  = compute_binary_metrics(y_true_labels, results)
         lat     = compute_latency_stats(latencies)
@@ -322,20 +266,10 @@ def run_ablation(texts: list, y_true_labels: list) -> dict:
             "mean_latency_ms": lat["mean_ms"],
             "p50_latency_ms":  lat["p50_ms"],
         }
-        logger.info(
-            f"    F1={binary['f1']:.4f}  "
-            f"acc={binary['accuracy']:.4f}  "
-            f"FPR={binary['false_positive_rate']:.4f}  "
-            f"hardFPR={ablation[name]['hard_negative_fpr']}  "
-            f"lat={lat['mean_ms']:.1f}ms"
-        )
+        logger.info(f"Ablation {name}: F1={binary['f1']:.4f}, hard-negative FPR={ablation[name]['hard_negative_fpr']}")
 
     return ablation
 
-
-# ─────────────────────────────────────────────
-# REPORT FORMATTING
-# ─────────────────────────────────────────────
 
 def format_summary(report: dict) -> str:
     """Build human-readable text summary."""
@@ -351,7 +285,7 @@ def format_summary(report: dict) -> str:
         f"  Test set : {report['meta']['test_size']} samples",
         f"  Layers   : {report['meta']['layers_active']}/3 active",
         "",
-        "── BINARY CLASSIFICATION (attack vs benign) ──",
+        "BINARY CLASSIFICATION (attack vs benign)",
         f"  Accuracy  : {b['accuracy']:.4f}",
         f"  Precision : {b['precision']:.4f}",
         f"  F1        : {b['f1']:.4f}",
@@ -364,7 +298,7 @@ def format_summary(report: dict) -> str:
     hn = report.get("hard_negatives")
     if hn:
         lines += [
-            "── HELD-OUT HARD NEGATIVES (benign, never trained on) ──",
+            "HELD-OUT HARD NEGATIVES (benign, never trained on)",
             f"  FP Rate   : {hn['false_positive_rate']:.4f}  95% CI {hn['fpr_ci95']}  (n={hn['n']})",
             f"    of which BLOCK   : {hn['benign_block_rate']:.4f}   (user refused)",
             f"    of which MONITOR : {hn['benign_monitor_rate']:.4f}   (allowed, logged for review)",
@@ -373,7 +307,7 @@ def format_summary(report: dict) -> str:
     ex = report.get("external_test")
     if ex:
         lines += [
-            "── EXTERNAL TEST (WildGuard test, never trained on) ──",
+            "EXTERNAL TEST (WildGuard test, never trained on)",
             f"  F1        : {ex['f1']:.4f}   (n={ex['n']})",
             f"  Recall    : {ex['recall']:.4f}  95% CI {ex['recall_ci95']}",
             f"  FP Rate   : {ex['false_positive_rate']:.4f}  95% CI {ex['fpr_ci95']}",
@@ -381,12 +315,12 @@ def format_summary(report: dict) -> str:
         ]
 
     lines += [
-        "── MULTI-CLASS (7-class) ──",
+        "MULTI-CLASS (7-class)",
         f"  Weighted F1 : {m['weighted_f1']:.4f}",
         f"  Macro F1    : {m['macro_f1']:.4f}",
         f"  Accuracy    : {m['accuracy']:.4f}",
         "",
-        "── PER-CLASS F1 ──",
+        "PER-CLASS F1",
     ]
 
     for cls in LABEL_NAMES:
@@ -401,14 +335,14 @@ def format_summary(report: dict) -> str:
 
     lines += [
         "",
-        "── LATENCY (per sample, CPU) ──",
+        "LATENCY (per sample, CPU)",
         f"  Mean : {la['mean_ms']:.1f}ms",
         f"  p50  : {la['p50_ms']:.1f}ms",
         f"  p95  : {la['p95_ms']:.1f}ms",
         f"  p99  : {la['p99_ms']:.1f}ms",
         f"  Total: {la['total_ms']:.0f}ms for {report['meta']['test_size']} samples",
         "",
-        "── LAYER ABLATION (binary F1) ──",
+        "LAYER ABLATION (binary F1)",
     ]
 
     for name, vals in ab.items():
@@ -423,7 +357,7 @@ def format_summary(report: dict) -> str:
 
     lines += [
         "",
-        "── RISK SCORE DISTRIBUTION (mean per class) ──",
+        "RISK SCORE DISTRIBUTION (mean per class)",
     ]
     for cls, stats in report["score_distribution"].items():
         lines.append(
@@ -438,60 +372,30 @@ def format_summary(report: dict) -> str:
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
-
 def main():
     # Windows consoles (cp1252) cannot print Arabic/Malayalam test prompts
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    logger.info("=" * 60)
-    logger.info("  Phase 6 — Evaluation & Benchmarking")
-    logger.info("=" * 60)
-
     ensure_dirs(RESULTS_DIR)
-
-    # ── 1. Load test data ─────────────────────
-    logger.info("\nLoading test data...")
-    df     = load_test_data()
-    texts  = df["text"].tolist()
+    df = load_test_data()
+    texts = df["text"].tolist()
     labels = df["label_name"].tolist()
 
-    # Print class distribution
-    logger.info("\nTest set distribution:")
-    for cls in LABEL_NAMES:
-        count = labels.count(cls)
-        logger.info(f"  {cls:<22} {count}")
-
-    # ── 2. Load full engine ───────────────────
-    logger.info("\nLoading full RiskEngine (all 3 layers)...")
     engine = RiskEngine(load_classifier=True, load_embedding=True)
     status = engine.status()
-    logger.info(f"Layers active: {status['layers_active']}/3")
+    logger.info(f"Evaluating {len(texts)} test samples with {status['layers_active']}/3 layers")
 
-    # ── 3. Run full inference ─────────────────
-    logger.info(f"\nRunning inference on {len(texts)} test samples...")
     results, latencies = run_inference(engine, texts)
-
-    # ── 4. Compute metrics ────────────────────
-    logger.info("\nComputing metrics...")
-
-    binary     = compute_binary_metrics(labels, results)
+    binary = compute_binary_metrics(labels, results)
     multiclass = compute_multiclass_metrics(labels, results)
-    latency    = compute_latency_stats(latencies)
+    latency = compute_latency_stats(latencies)
     score_dist = compute_score_distribution(labels, results)
-
-    logger.info("\nEvaluating held-out hard negatives and external test set...")
     hard_neg = evaluate_extra_set(engine, HARD_NEG_CSV)
     external = evaluate_extra_set(engine, EXTERNAL_CSV)
-
-    # ── 5. Layer ablation ─────────────────────
-    logger.info("\nRunning ablation study (3 configurations)...")
     ablation = run_ablation(texts, labels)
 
-    # ── 6. Assemble report ────────────────────
+    # Assemble report
     report = {
         "meta": {
             "test_size":     len(texts),
@@ -509,23 +413,14 @@ def main():
         "score_distribution": score_dist,
     }
 
-    # ── 7. Save outputs ───────────────────────
     with open(REPORT_JSON, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
-    logger.info(f"\nReport JSON saved → {REPORT_JSON}")
-
     summary = format_summary(report)
     with open(REPORT_TXT, "w", encoding="utf-8") as f:
         f.write(summary)
-    logger.info(f"Summary TXT saved  → {REPORT_TXT}")
 
-    # ── 8. Print summary ──────────────────────
     print("\n" + summary)
-
-    logger.info("=" * 60)
-    logger.info("  Evaluation complete.")
-    logger.info("=" * 60)
-    logger.info("Send data/results/evaluation_summary.txt to update the README numbers.")
+    logger.info(f"Saved {REPORT_JSON} and {REPORT_TXT}")
 
 
 if __name__ == "__main__":

@@ -1,102 +1,65 @@
 # src/jailbreak_detection/detection/rule_engine.py
 """
-Layer 1 — Rule-Based Detection Engine.
+Layer 1: regex rules for known attack patterns.
 
-Fastest detection layer — runs first before any ML.
-Uses regex patterns to catch known attack signatures.
-
-If this layer gives severity 5, we skip all other layers
-and block immediately. No need to waste ML compute.
-
-Attack categories covered:
-- Direct jailbreak (DAN, developer mode, etc.)
-- Prompt injection (system overrides, instruction tags)
-- Role-play hijack (pretend, act as, fictional framing)
-- Encoding attacks (base64, reversed, obfuscated)
-- Many-shot attacks (repeated examples to condition model)
-- Indirect injection (hidden instructions in content)
+The fastest layer, and it runs first. A severity-5 match blocks at once,
+so the ML layers are skipped for obvious attacks.
 """
 
 import re
 from dataclasses import dataclass, field
-from typing import List
-from src.jailbreak_detection.utils import logger
+
 from src.jailbreak_detection.constants import (
+    DECISION_ALLOW,
     DECISION_BLOCK,
     DECISION_MONITOR,
-    DECISION_ALLOW,
     SEVERITY_CRITICAL,
     SEVERITY_HIGH,
+    SEVERITY_LOW,
     SEVERITY_MEDIUM,
-    SEVERITY_LOW
 )
+from src.jailbreak_detection.utils import logger
 
-
-# -----------------------------------------------
-# DATA CLASSES
-# -----------------------------------------------
 
 @dataclass
 class RuleMatch:
-    """Represents a single rule that matched the input"""
-    rule_id:         str
-    category:        str
-    severity:        int
-    matched_text:    str
-    context:         str   # Surrounding text for explanation
-    description:     str   # Human readable description
+    rule_id: str
+    category: str
+    severity: int
+    matched_text: str
+    context: str        # text around the match, for explanations
+    description: str
 
 
 @dataclass
 class RuleEngineResult:
-    """Full result from the rule engine"""
-    input_text:      str
-    matches:         List[RuleMatch] = field(default_factory=list)
-    max_severity:    int = 0
-    categories_hit:  List[str] = field(default_factory=list)
-    decision:        str = DECISION_ALLOW
-    explanation:     str = "No rule matches found"
-    rule_score:      float = 0.0   # Normalized 0.0 - 1.0
+    input_text: str
+    matches: list = field(default_factory=list)
+    max_severity: int = 0
+    categories_hit: list = field(default_factory=list)   # most severe first
+    decision: str = DECISION_ALLOW
+    explanation: str = "No rule matches found"
+    rule_score: float = 0.0   # 0.0 - 1.0
 
-
-# -----------------------------------------------
-# RULE ENGINE
-# -----------------------------------------------
 
 class RuleEngine:
     """
-    Fast regex-based detection for known attack patterns.
-
-    Usage:
-        engine = RuleEngine()
-        result = engine.check("ignore all previous instructions")
+    engine = RuleEngine()
+    result = engine.check("ignore all previous instructions")
     """
 
     def __init__(self):
         self.rules = self._load_rules()
-        # Compile once, not on every request
-        self._compiled = {
-            rule_id: re.compile(rule["pattern"], re.IGNORECASE | re.DOTALL | re.UNICODE)
-            for rule_id, rule in self.rules.items()
-        }
-        logger.info(f"RuleEngine initialized with {len(self.rules)} rules")
+        flags = re.IGNORECASE | re.DOTALL | re.UNICODE
+        self.patterns = {rule_id: re.compile(rule["pattern"], flags) for rule_id, rule in self.rules.items()}
+        logger.info(f"RuleEngine loaded {len(self.rules)} rules")
 
     def _load_rules(self) -> dict:
-        """
-        All detection rules organized by category.
-
-        Each rule has:
-        - pattern:     regex to match
-        - category:    attack type
-        - severity:    1-5 (5 = block immediately)
-        - description: human readable explanation
-        """
+        """rule_id -> pattern, category, severity (1-5, 5 = block at once), description."""
         return {
 
-            # ─────────────────────────────────────────
-            # CATEGORY 1 — DIRECT JAILBREAK
+            # Direct jailbreak
             # Explicit attempts to override AI safety
-            # ─────────────────────────────────────────
 
             "DJ001": {
                 "pattern": r"ignore\s+(all\s+)?(previous|prior|above|your)\s+(instructions?|prompts?|rules?|guidelines?|constraints?)",
@@ -189,10 +152,8 @@ class RuleEngine:
                 "description": "Unrestricted simulation request"
             },
 
-            # ─────────────────────────────────────────
-            # CATEGORY 2 — PROMPT INJECTION
+            # Prompt injection
             # Injecting instructions to override system
-            # ─────────────────────────────────────────
 
             "PI001": {
                 "pattern": r"<\s*system\s*>.*?<\s*/\s*system\s*>",
@@ -246,10 +207,8 @@ class RuleEngine:
                 "description": "Hidden instruction reveal attempt"
             },
 
-            # ─────────────────────────────────────────
-            # CATEGORY 3 — ROLE-PLAY HIJACK
+            # Role-play hijack
             # Using fiction/personas to extract harmful content
-            # ─────────────────────────────────────────
 
             "RP001": {
                 "pattern": r"(play|act\s+as|pretend\s+(to\s+be|you\s+are)|you\s+are\s+now|become)\s+(an?\s+)?(evil|malicious|unethical|unrestricted|rogue|corrupt)\s+(AI|assistant|bot|model|version)",
@@ -282,10 +241,8 @@ class RuleEngine:
                 "description": "Hypothetical framing attack"
             },
 
-            # ─────────────────────────────────────────
-            # CATEGORY 4 — ENCODING ATTACKS
+            # Encoding attacks
             # Obfuscation to bypass keyword filters
-            # ─────────────────────────────────────────
 
             "EN001": {
                 "pattern": r"[A-Za-z0-9+/]{40,}={0,2}",
@@ -312,10 +269,8 @@ class RuleEngine:
                 "description": "Repeated character obfuscation"
             },
 
-            # ─────────────────────────────────────────
-            # CATEGORY 5 — MANY-SHOT ATTACKS
+            # Many-shot attacks
             # Flooding context with examples of compliance
-            # ─────────────────────────────────────────
 
             "MS001": {
                 "pattern": r"(human|user|h)\s*:\s*.+?\n\s*(assistant|ai|a)\s*:\s*.+?(\n\s*(human|user|h)\s*:\s*.+?\n\s*(assistant|ai|a)\s*:\s*.+?){3,}",
@@ -330,10 +285,8 @@ class RuleEngine:
                 "description": "Multiple examples conditioning"
             },
 
-            # ─────────────────────────────────────────
-            # CATEGORY 6 — INDIRECT INJECTION
+            # Indirect injection
             # Hidden instructions in retrieved content
-            # ─────────────────────────────────────────
 
             "II001": {
                 "pattern": r"<!--.{0,500}(ignore|instruction|system|override|forget).{0,200}-->",
@@ -361,116 +314,55 @@ class RuleEngine:
             },
         }
 
-    # -----------------------------------------------
-    # MAIN CHECK METHOD
-    # -----------------------------------------------
 
     def check(self, text: str) -> RuleEngineResult:
-        """
-        Main entry point — check text against all rules.
-
-        Args:
-            text: The input text to check
-                  (use text_for_detection from normalizer output)
-
-        Returns:
-            RuleEngineResult with all matches and final decision
-        """
         if not text or not isinstance(text, str):
             return RuleEngineResult(input_text="")
 
         matches = []
-
         for rule_id, rule in self.rules.items():
-            try:
-                found = self._compiled[rule_id].search(text)
+            found = self.patterns[rule_id].search(text)
+            if not found:
+                continue
+            start, end = max(0, found.start() - 40), min(len(text), found.end() + 40)
+            matches.append(RuleMatch(
+                rule_id=rule_id,
+                category=rule["category"],
+                severity=rule["severity"],
+                matched_text=found.group()[:100],
+                context=text[start:end],
+                description=rule["description"],
+            ))
+        return self.build_result(text, matches)
 
-                if found:
-                    # Extract context around match
-                    start = max(0, found.start() - 40)
-                    end   = min(len(text), found.end() + 40)
-                    context = text[start:end]
-
-                    matches.append(RuleMatch(
-                        rule_id=rule_id,
-                        category=rule["category"],
-                        severity=rule["severity"],
-                        matched_text=found.group()[:100],
-                        context=context,
-                        description=rule["description"]
-                    ))
-
-                    logger.debug(
-                        f"Rule {rule_id} matched — "
-                        f"Category: {rule['category']} | "
-                        f"Severity: {rule['severity']}"
-                    )
-
-            except re.error as e:
-                logger.error(f"Regex error in rule {rule_id}: {e}")
-
-        return self._build_result(text, matches)
-
-    # -----------------------------------------------
-    # RESULT BUILDER
-    # -----------------------------------------------
-
-    def _build_result(
-        self,
-        text: str,
-        matches: List[RuleMatch]
-    ) -> RuleEngineResult:
-        """
-        Builds the final RuleEngineResult from all matches.
-        """
+    def build_result(self, text: str, matches: list) -> RuleEngineResult:
         if not matches:
             return RuleEngineResult(
                 input_text=text[:100],
-                matches=[],
-                max_severity=0,
-                categories_hit=[],
-                decision=DECISION_ALLOW,
                 explanation="No rule matches — input appears clean",
-                rule_score=0.0
             )
 
-        # Get max severity across all matches
         max_severity = max(m.severity for m in matches)
+        # Score: severity / 5, plus a small boost for each extra match
+        rule_score = min(1.0, max_severity / 5.0 + min(0.2, len(matches) * 0.03))
+        decision = DECISION_BLOCK if max_severity >= SEVERITY_HIGH else DECISION_MONITOR
 
-        # Get unique categories hit
-        categories_hit = list({m.category for m in matches})
+        # Categories ordered by their most severe match (stable on ties).
+        # A set here gave a different order on every run.
+        by_severity = sorted(matches, key=lambda m: m.severity, reverse=True)
+        categories = list(dict.fromkeys(m.category for m in by_severity))
 
-        # Normalize score: severity/5 boosted by number of matches
-        base_score   = max_severity / 5.0
-        match_boost  = min(0.2, len(matches) * 0.03)
-        rule_score   = min(1.0, base_score + match_boost)
-
-        # Decision logic
-        if max_severity >= SEVERITY_CRITICAL:
-            decision = DECISION_BLOCK
-        elif max_severity >= SEVERITY_HIGH:
-            decision = DECISION_BLOCK
-        elif max_severity >= SEVERITY_MEDIUM:
-            decision = DECISION_MONITOR
-        else:
-            decision = DECISION_MONITOR
-
-        # Build explanation
-        top_match = max(matches, key=lambda m: m.severity)
+        top = by_severity[0]
         explanation = (
-            f"Rule {top_match.rule_id} triggered — "
-            f"{top_match.description} | "
-            f"Category: {top_match.category} | "
-            f"Severity: {top_match.severity}/5 | "
-            f"Total matches: {len(matches)}"
+            f"Rule {top.rule_id} triggered — {top.description} | Category: {top.category} | "
+            f"Severity: {top.severity}/5 | Total matches: {len(matches)}"
         )
-
         return RuleEngineResult(
             input_text=text[:100],
             matches=matches,
             max_severity=max_severity,
-            categories_hit=categories_hit,
+            categories_hit=categories,
             decision=decision,
             explanation=explanation,
-            rule_score=rule_score
+            rule_score=rule_score,
         )
